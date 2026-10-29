@@ -1,0 +1,2371 @@
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 8bf7ff8..785b692 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -68,6 +68,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.CAMERA" />
+@@ -202,6 +203,27 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+ 
+         <!-- Plugin-related activities and services -->
+ 
++        <!-- Audio streaming between devices -->
++        <activity
++            android:name="org.kde.kdeconnect.plugins.audiostream.AudioCaptureConsentActivity"
++            android:theme="@style/Theme.Transparent"
++            android:excludeFromRecents="true"
++            android:exported="false" />
++        <service
++            android:name="org.kde.kdeconnect.plugins.audiostream.AudioCaptureService"
++            android:foregroundServiceType="mediaProjection"
++            android:exported="false" />
++
++        <!-- Browsing the files of another device -->
++        <activity
++            android:name="org.kde.kdeconnect.plugins.sftp.RemoteFilesActivity"
++            android:exported="false"
++            android:parentActivityName="org.kde.kdeconnect.ui.MainActivity">
++            <meta-data
++                android:name="android.support.PARENT_ACTIVITY"
++                android:value="org.kde.kdeconnect.ui.MainActivity" />
++        </activity>
++
+         <activity
+             android:name="org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity"
+             android:theme="@style/Theme.Transparent"
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureConsentActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureConsentActivity.kt
+new file mode 100644
+index 0000000..855e555
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureConsentActivity.kt
+@@ -0,0 +1,94 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import android.Manifest
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.media.projection.MediaProjectionManager
++import android.os.Build
++import android.os.Bundle
++import android.widget.Toast
++import androidx.activity.ComponentActivity
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.annotation.StringRes
++import androidx.core.content.ContextCompat
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect_tp.R
++
++/**
++ * Invisible activity that collects what Android requires before an app can capture the audio
++ * played by other apps: the microphone permission and the screen capture consent dialog.
++ * Once both are granted, it hands over to [AudioCaptureService].
++ */
++class AudioCaptureConsentActivity : ComponentActivity() {
++
++    private lateinit var deviceId: String
++
++    private val recordAudioLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
++        if (granted) launchProjectionDialog() else fail(R.string.audiostream_permission_denied)
++    }
++
++    private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
++        val data = result.data
++        if (result.resultCode == RESULT_OK && data != null) {
++            startCapture(result.resultCode, data)
++        } else {
++            fail(R.string.audiostream_consent_denied)
++        }
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++
++        val id = intent.getStringExtra(EXTRA_DEVICE_ID)
++        if (id == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
++            fail(R.string.audiostream_unsupported)
++            return
++        }
++        deviceId = id
++
++        // After a configuration change the launchers above deliver their pending result on their own
++        if (savedInstanceState != null) return
++
++        val hasPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
++            PackageManager.PERMISSION_GRANTED
++        if (hasPermission) {
++            launchProjectionDialog()
++        } else {
++            recordAudioLauncher.launch(Manifest.permission.RECORD_AUDIO)
++        }
++    }
++
++    private fun launchProjectionDialog() {
++        val manager = getSystemService<MediaProjectionManager>()
++        if (manager == null) {
++            fail(R.string.audiostream_unsupported)
++            return
++        }
++        // Tip for the user: if the shared audio is silent, choose to share the entire screen,
++        // since sharing a single app limits which audio can be captured on recent Android versions.
++        projectionLauncher.launch(manager.createScreenCaptureIntent())
++    }
++
++    private fun startCapture(resultCode: Int, data: Intent) {
++        val serviceIntent = Intent(this, AudioCaptureService::class.java)
++            .putExtra(AudioCaptureService.EXTRA_DEVICE_ID, deviceId)
++            .putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
++            .putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
++        ContextCompat.startForegroundService(this, serviceIntent)
++        finish()
++    }
++
++    private fun fail(@StringRes message: Int) {
++        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
++        finish()
++    }
++
++    companion object {
++        const val EXTRA_DEVICE_ID = "deviceId"
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureService.kt
+new file mode 100644
+index 0000000..cc0adbe
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureService.kt
+@@ -0,0 +1,239 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import android.Manifest
++import android.app.Notification
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.content.pm.ServiceInfo
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioPlaybackCaptureConfiguration
++import android.media.AudioRecord
++import android.media.projection.MediaProjection
++import android.media.projection.MediaProjectionManager
++import android.os.Build
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.Process
++import android.util.Log
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.app.ServiceCompat
++import androidx.core.content.ContextCompat
++import androidx.core.content.IntentCompat
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect.Device
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect_tp.R
++
++/**
++ * Captures everything this phone plays (music, videos, games...) and streams it to another device
++ * as raw PCM through the payload of a [AudioStreamPlugin.PACKET_TYPE_AUDIOSTREAM] packet.
++ *
++ * Uses Android's AudioPlaybackCapture, which needs Android 10 (API 29) and the user's consent
++ * through the screen capture dialog (see [AudioCaptureConsentActivity]). Apps can opt out of being
++ * captured, so some of them (e.g. DRM-protected streaming apps) will stay silent.
++ */
++@RequiresApi(Build.VERSION_CODES.Q)
++class AudioCaptureService : Service() {
++
++    private val lock = Any()
++    private var projection: MediaProjection? = null
++    private var record: AudioRecord? = null
++    private var pipe: PcmPipeInputStream? = null
++
++    @Volatile
++    private var running = false
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent == null || intent.action == ACTION_STOP) {
++            stopStreaming()
++            return START_NOT_STICKY
++        }
++
++        // A service started with startForegroundService() must call startForeground() promptly,
++        // and on Android 14+ it has to happen before the MediaProjection is created.
++        val device = intent.getStringExtra(EXTRA_DEVICE_ID)?.let { KdeConnect.getInstance().getDevice(it) }
++        ServiceCompat.startForeground(
++            this,
++            NOTIFICATION_ID,
++            buildNotification(device?.name.orEmpty()),
++            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
++        )
++
++        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
++        val resultData = IntentCompat.getParcelableExtra(intent, EXTRA_RESULT_DATA, Intent::class.java)
++        val hasPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
++            PackageManager.PERMISSION_GRANTED
++
++        if (device == null || resultData == null || !hasPermission || !device.isReachable) {
++            Log.w(LOG_TAG, "Not starting: device=$device, data=$resultData, permission=$hasPermission")
++            stopStreaming()
++            return START_NOT_STICKY
++        }
++
++        stopStreaming(stopService = false) // Replace any previous stream
++        try {
++            startStreaming(device, resultCode, resultData)
++        } catch (e: Exception) {
++            Log.e(LOG_TAG, "Could not start capturing audio", e)
++            stopStreaming()
++        }
++        return START_NOT_STICKY
++    }
++
++    override fun onDestroy() {
++        stopStreaming(stopService = false)
++        super.onDestroy()
++    }
++
++    private fun startStreaming(device: Device, resultCode: Int, resultData: Intent) {
++        val projectionManager = getSystemService<MediaProjectionManager>()!!
++        val newProjection = projectionManager.getMediaProjection(resultCode, resultData)
++            ?: throw IllegalStateException("Screen capture was not granted")
++
++        // Required on Android 14+, and tells us when the user stops the capture from the system UI
++        newProjection.registerCallback(object : MediaProjection.Callback() {
++            override fun onStop() {
++                stopStreaming()
++            }
++        }, Handler(Looper.getMainLooper()))
++
++        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(newProjection)
++            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
++            .addMatchingUsage(AudioAttributes.USAGE_GAME)
++            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
++            .build()
++
++        val format = AudioFormat.Builder()
++            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++            .setSampleRate(SAMPLE_RATE)
++            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
++            .build()
++
++        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
++        val newRecord = AudioRecord.Builder()
++            .setAudioFormat(format)
++            .setBufferSizeInBytes(maxOf(minBuffer, CHUNK_BYTES * 4))
++            .setAudioPlaybackCaptureConfig(captureConfig)
++            .build()
++        if (newRecord.state != AudioRecord.STATE_INITIALIZED) {
++            newRecord.release()
++            newProjection.stop()
++            throw IllegalStateException("Could not initialize the audio capture")
++        }
++
++        val newPipe = PcmPipeInputStream(onClosed = { stopStreaming() })
++
++        synchronized(lock) {
++            projection = newProjection
++            record = newRecord
++            pipe = newPipe
++            running = true
++        }
++        AudioShareState.started(device.deviceId) { stopStreaming() }
++
++        val packet = NetworkPacket(AudioStreamPlugin.PACKET_TYPE_AUDIOSTREAM).apply {
++            this["sampleRate"] = SAMPLE_RATE
++            this["channels"] = CHANNELS
++            this["encoding"] = AudioStreamPlugin.ENCODING_PCM_S16LE
++            // The size of a live stream is unknown, and the payload ends when the stream closes
++            payload = NetworkPacket.Payload(newPipe, -1L)
++        }
++        device.sendPacket(packet, object : Device.SendPacketStatusCallback() {
++            override fun onSuccess() {}
++
++            override fun onFailure(e: Throwable) {
++                Log.e(LOG_TAG, "Could not send the audio stream to ${device.name}", e)
++                stopStreaming()
++            }
++        })
++
++        newRecord.startRecording()
++        Thread({ captureLoop(newRecord, newPipe) }, "AudioCapture").start()
++    }
++
++    private fun captureLoop(source: AudioRecord, destination: PcmPipeInputStream) {
++        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
++        val buffer = ByteArray(CHUNK_BYTES)
++        while (running) {
++            val read = source.read(buffer, 0, buffer.size)
++            if (read < 0) break // The capture was stopped or failed
++            if (read > 0) destination.push(buffer.copyOf(read))
++        }
++        if (running) stopStreaming() // Ended by itself, not because we were asked to stop
++    }
++
++    private fun stopStreaming(stopService: Boolean = true) {
++        var recordToRelease: AudioRecord? = null
++        var projectionToStop: MediaProjection? = null
++        var pipeToFinish: PcmPipeInputStream? = null
++        synchronized(lock) {
++            running = false
++            recordToRelease = record
++            projectionToStop = projection
++            pipeToFinish = pipe
++            record = null
++            projection = null
++            pipe = null
++        }
++        AudioShareState.ended()
++
++        pipeToFinish?.finish()
++        recordToRelease?.let {
++            runCatching { it.stop() }
++            it.release()
++        }
++        projectionToStop?.let { runCatching { it.stop() } }
++
++        if (stopService) {
++            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
++            stopSelf()
++        }
++    }
++
++    private fun buildNotification(deviceName: String): Notification {
++        val stopIntent = PendingIntent.getService(
++            this,
++            0,
++            Intent(this, AudioCaptureService::class.java).setAction(ACTION_STOP),
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        )
++        return NotificationCompat.Builder(this, NotificationHelper.Channels.MEDIA_CONTROL)
++            .setSmallIcon(R.drawable.ic_notification)
++            .setContentTitle(getString(R.string.audiostream_notification_title, deviceName))
++            .setOngoing(true)
++            .setOnlyAlertOnce(true)
++            .addAction(R.drawable.ic_stop, getString(R.string.audiostream_notification_stop), stopIntent)
++            .build()
++    }
++
++    companion object {
++        const val EXTRA_DEVICE_ID = "deviceId"
++        const val EXTRA_RESULT_CODE = "resultCode"
++        const val EXTRA_RESULT_DATA = "resultData"
++        const val ACTION_STOP = "org.kde.kdeconnect.plugins.audiostream.STOP"
++
++        private const val LOG_TAG = "AudioCaptureService"
++        private const val NOTIFICATION_ID = 0x41554431
++
++        const val SAMPLE_RATE = 48000
++        const val CHANNELS = 2
++        private const val BYTES_PER_FRAME = CHANNELS * 2
++
++        // 20 ms of audio per chunk
++        private const val CHUNK_BYTES = SAMPLE_RATE / 50 * BYTES_PER_FRAME
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioShareState.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioShareState.kt
+new file mode 100644
+index 0000000..b72c3ef
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioShareState.kt
+@@ -0,0 +1,39 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++/**
++ * Tracks which device this phone is currently sending its audio to.
++ *
++ * Kept apart from [AudioCaptureService] (which uses Android 10+ APIs) so the plugin can query
++ * and stop a share on older Android versions without touching that class.
++ */
++internal object AudioShareState {
++
++    @Volatile
++    var activeDeviceId: String? = null
++        private set
++
++    @Volatile
++    private var stopAction: (() -> Unit)? = null
++
++    fun started(deviceId: String, stop: () -> Unit) {
++        activeDeviceId = deviceId
++        stopAction = stop
++    }
++
++    fun ended() {
++        activeDeviceId = null
++        stopAction = null
++    }
++
++    fun isSharingWith(deviceId: String): Boolean = activeDeviceId == deviceId
++
++    /** Stops the share, but only if it is going to [deviceId]. */
++    fun stopIfSharingWith(deviceId: String) {
++        if (activeDeviceId == deviceId) stopAction?.invoke()
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlayer.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlayer.kt
+new file mode 100644
+index 0000000..7db43bb
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlayer.kt
+@@ -0,0 +1,106 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import android.media.AudioFormat
++import android.media.AudioManager
++import android.media.AudioTrack
++import android.os.Process
++import android.util.Log
++import org.kde.kdeconnect.NetworkPacket
++import java.io.IOException
++
++/**
++ * Plays the raw 16-bit PCM audio that arrives through a [NetworkPacket.Payload] until the
++ * other phone stops sending, [stop] is called or the connection drops.
++ *
++ * Works on every Android version supported by the app (only capturing audio needs Android 10).
++ */
++internal class AudioStreamPlayer(
++    private val sampleRate: Int,
++    private val channels: Int,
++    private val payload: NetworkPacket.Payload,
++    private val onFinished: (AudioStreamPlayer) -> Unit,
++) {
++    @Volatile
++    private var stopped = false
++
++    private var thread: Thread? = null
++
++    fun start() {
++        thread = Thread({ playLoop() }, "AudioStreamPlayer").also { it.start() }
++    }
++
++    /** Safe to call from any thread, and more than once. */
++    fun stop() {
++        stopped = true
++        // Closing the payload closes its socket, which unblocks a read() in progress
++        payload.close()
++    }
++
++    @Suppress("DEPRECATION") // The AudioTrack constructor is the only one available on API < 26
++    private fun playLoop() {
++        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
++
++        var track: AudioTrack? = null
++        try {
++            val input = payload.inputStream ?: throw IOException("Audio stream has no data")
++
++            val channelMask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
++            val frameSize = channels * BYTES_PER_SAMPLE
++            val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
++            if (minBuffer <= 0) throw IOException("Unsupported audio format: $sampleRate Hz, $channels channels")
++
++            // ~200 ms of audio absorbs Wi-Fi jitter without adding a noticeable delay
++            val bufferSize = maxOf(minBuffer, sampleRate * frameSize / 5)
++            track = AudioTrack(
++                AudioManager.STREAM_MUSIC,
++                sampleRate,
++                channelMask,
++                AudioFormat.ENCODING_PCM_16BIT,
++                bufferSize,
++                AudioTrack.MODE_STREAM
++            )
++            if (track.state != AudioTrack.STATE_INITIALIZED) throw IOException("Could not initialize the audio output")
++            track.play()
++
++            val buffer = ByteArray(READ_BUFFER_BYTES - READ_BUFFER_BYTES % frameSize)
++            var filled = 0
++            while (!stopped) {
++                val read = input.read(buffer, filled, buffer.size - filled)
++                if (read < 0) break
++                filled += read
++
++                // AudioTrack needs whole frames, keep any partial frame for the next round
++                val usable = filled - filled % frameSize
++                var offset = 0
++                while (offset < usable && !stopped) {
++                    val written = track.write(buffer, offset, usable - offset)
++                    if (written <= 0) throw IOException("Audio output failed ($written)")
++                    offset += written
++                }
++                val remainder = filled - usable
++                if (remainder > 0) System.arraycopy(buffer, usable, buffer, 0, remainder)
++                filled = remainder
++            }
++        } catch (e: Exception) {
++            if (!stopped) Log.w(LOG_TAG, "Audio playback ended with an error", e)
++        } finally {
++            track?.let {
++                runCatching { it.stop() }
++                it.release()
++            }
++            payload.close()
++            onFinished(this)
++        }
++    }
++
++    private companion object {
++        const val LOG_TAG = "AudioStreamPlayer"
++        const val BYTES_PER_SAMPLE = 2
++        const val READ_BUFFER_BYTES = 16 * 1024
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlugin.kt
+new file mode 100644
+index 0000000..38ea10e
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioStreamPlugin.kt
+@@ -0,0 +1,217 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import android.Manifest
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import android.widget.Toast
++import androidx.annotation.StringRes
++import androidx.core.app.NotificationCompat
++import androidx.core.content.ContextCompat
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect.plugins.Plugin
++import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
++import org.kde.kdeconnect_tp.R
++
++/**
++ * Streams the audio output of one phone to another, live.
++ *
++ * - Sending ("Send this phone's audio here") needs Android 10+, because that is when Android
++ *   started letting apps capture the audio played by other apps.
++ * - Receiving ("Play its audio on this phone") works on any Android version.
++ *
++ * The audio travels as raw 16-bit PCM through the payload of a `kdeconnect.audiostream` packet, over
++ * the same encrypted connection used by the rest of KDE Connect.
++ */
++@LoadablePlugin
++class AudioStreamPlugin : Plugin() {
++
++    override val displayName: String
++        get() = context.getString(R.string.pref_plugin_audiostream)
++
++    override val description: String
++        get() = context.getString(R.string.pref_plugin_audiostream_desc)
++
++    override val supportedPacketTypes: Array<String> = arrayOf(PACKET_TYPE_AUDIOSTREAM, PACKET_TYPE_AUDIOSTREAM_REQUEST)
++
++    override val outgoingPacketTypes: Array<String> = arrayOf(PACKET_TYPE_AUDIOSTREAM, PACKET_TYPE_AUDIOSTREAM_REQUEST)
++
++    private var player: AudioStreamPlayer? = null
++
++    private val canCaptureAudio: Boolean
++        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
++
++    override fun onDestroy() {
++        stopPlayback()
++        AudioShareState.stopIfSharingWith(device.deviceId)
++    }
++
++    override fun onPacketReceived(np: NetworkPacket): Boolean {
++        return when (np.type) {
++            PACKET_TYPE_AUDIOSTREAM -> handleIncomingStream(np)
++            PACKET_TYPE_AUDIOSTREAM_REQUEST -> handleRequest(np)
++            else -> false
++        }
++    }
++
++    // -- Receiving ----------------------------------------------------------------------------
++
++    private fun handleIncomingStream(np: NetworkPacket): Boolean {
++        if (np.has("error")) {
++            np.payload?.close()
++            toast(R.string.audiostream_unsupported_remote, device.name)
++            return true
++        }
++
++        val payload = np.payload
++        if (payload == null) {
++            Log.w(LOG_TAG, "Received an audio stream without data")
++            return false
++        }
++
++        val sampleRate = np.getInt("sampleRate", DEFAULT_SAMPLE_RATE)
++        val channels = np.getInt("channels", DEFAULT_CHANNELS)
++        val encoding = np.getString("encoding", ENCODING_PCM_S16LE)
++        if (encoding != ENCODING_PCM_S16LE || sampleRate !in 8000..192000 || channels !in 1..2) {
++            Log.w(LOG_TAG, "Unsupported audio stream: $encoding, $sampleRate Hz, $channels channels")
++            payload.close()
++            return false
++        }
++
++        stopPlayback()
++        val newPlayer = AudioStreamPlayer(sampleRate, channels, payload) { finished ->
++            // Only forget the player if it wasn't already replaced by a newer stream
++            synchronized(this) { if (player === finished) player = null }
++        }
++        synchronized(this) { player = newPlayer }
++        newPlayer.start()
++        toast(R.string.audiostream_playing, device.name)
++        return true
++    }
++
++    private fun stopPlayback() {
++        val current = synchronized(this) { player.also { player = null } }
++        current?.stop()
++    }
++
++    private fun requestRemoteAudio() {
++        device.sendPacket(NetworkPacket(PACKET_TYPE_AUDIOSTREAM_REQUEST).apply { this["action"] = ACTION_START })
++        toast(R.string.audiostream_waiting, device.name)
++    }
++
++    private fun stopListening() {
++        stopPlayback()
++        device.sendPacket(NetworkPacket(PACKET_TYPE_AUDIOSTREAM_REQUEST).apply { this["action"] = ACTION_STOP })
++    }
++
++    // -- Sending ------------------------------------------------------------------------------
++
++    private fun handleRequest(np: NetworkPacket): Boolean {
++        when (np.getString("action")) {
++            ACTION_START -> {
++                if (!canCaptureAudio) {
++                    device.sendPacket(NetworkPacket(PACKET_TYPE_AUDIOSTREAM).apply {
++                        this["error"] = ERROR_UNSUPPORTED_ANDROID_VERSION
++                    })
++                } else {
++                    showShareRequest()
++                }
++            }
++            ACTION_STOP -> AudioShareState.stopIfSharingWith(device.deviceId)
++            else -> return false
++        }
++        return true
++    }
++
++    private fun startSharing(parentActivity: android.app.Activity) {
++        parentActivity.startActivity(
++            Intent(parentActivity, AudioCaptureConsentActivity::class.java)
++                .putExtra(AudioCaptureConsentActivity.EXTRA_DEVICE_ID, device.deviceId)
++        )
++    }
++
++    /**
++     * Android only lets us start capturing audio from a visible activity, so another device can't
++     * start the stream by itself: we ask the user to confirm with a tap on a notification.
++     */
++    private fun showShareRequest() {
++        val notificationsAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
++            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
++        if (!notificationsAllowed) {
++            toast(R.string.audiostream_open_app_hint, device.name)
++            return
++        }
++
++        val consentIntent = Intent(context, AudioCaptureConsentActivity::class.java)
++            .putExtra(AudioCaptureConsentActivity.EXTRA_DEVICE_ID, device.deviceId)
++        val pendingIntent = PendingIntent.getActivity(
++            context,
++            device.deviceId.hashCode(),
++            consentIntent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        )
++        val notification = NotificationCompat.Builder(context, NotificationHelper.Channels.HIGHPRIORITY)
++            .setSmallIcon(R.drawable.ic_notification)
++            .setContentTitle(context.getString(R.string.audiostream_request_title, device.name))
++            .setContentText(context.getString(R.string.audiostream_request_text))
++            .setContentIntent(pendingIntent)
++            .setAutoCancel(true)
++            .setPriority(NotificationCompat.PRIORITY_HIGH)
++            .build()
++        context.getSystemService<NotificationManager>()!!.notify(device.deviceId.hashCode(), notification)
++    }
++
++    // -- UI -----------------------------------------------------------------------------------
++
++    override fun getUiButtons(): List<PluginUiButton> = buildList {
++        if (canCaptureAudio) {
++            add(PluginUiButton(context.getString(R.string.audiostream_send_here), R.drawable.ic_volume) { activity ->
++                startSharing(activity)
++            })
++        }
++        add(PluginUiButton(context.getString(R.string.audiostream_listen), R.drawable.ic_volume) {
++            requestRemoteAudio()
++        })
++    }
++
++    override fun getUiMenuEntries(): List<PluginUiMenuEntry> = listOf(
++        PluginUiMenuEntry(context.getString(R.string.audiostream_stop)) {
++            stopListening()
++            AudioShareState.stopIfSharingWith(device.deviceId)
++        }
++    )
++
++    private fun toast(@StringRes message: Int, vararg formatArgs: Any) {
++        Handler(Looper.getMainLooper()).post {
++            Toast.makeText(context, context.getString(message, *formatArgs), Toast.LENGTH_LONG).show()
++        }
++    }
++
++    companion object {
++        const val PACKET_TYPE_AUDIOSTREAM = "kdeconnect.audiostream"
++        const val PACKET_TYPE_AUDIOSTREAM_REQUEST = "kdeconnect.audiostream.request"
++
++        const val ENCODING_PCM_S16LE = "pcm_s16le"
++
++        private const val ACTION_START = "start"
++        private const val ACTION_STOP = "stop"
++        private const val ERROR_UNSUPPORTED_ANDROID_VERSION = "unsupported_android_version"
++
++        private const val DEFAULT_SAMPLE_RATE = 48000
++        private const val DEFAULT_CHANNELS = 2
++
++        private const val LOG_TAG = "AudioStreamPlugin"
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStream.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStream.kt
+new file mode 100644
+index 0000000..f8ad89e
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStream.kt
+@@ -0,0 +1,99 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import java.io.InputStream
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.atomic.AtomicBoolean
++
++/**
++ * An [InputStream] fed in real time by the audio capture thread and drained by the payload
++ * sender (see LanLink.sendPayload).
++ *
++ * The queue is bounded: when the network can't keep up, the oldest audio is dropped so the
++ * stream never falls further and further behind what is playing on the sending phone.
++ *
++ * [onClosed] is called when the consumer closes the stream (the other phone stopped listening,
++ * the connection dropped or it never connected), so the capture can be stopped.
++ */
++internal class PcmPipeInputStream(private val onClosed: () -> Unit) : InputStream() {
++
++    private val queue = LinkedBlockingQueue<ByteArray>(MAX_QUEUED_CHUNKS)
++    private val finished = AtomicBoolean(false)
++
++    // Only touched by the single consumer thread
++    private var current: ByteArray = EMPTY
++    private var position = 0
++    private var reachedEnd = false
++    private var firstRead = true
++
++    /** Called by the capture thread. Never blocks. */
++    fun push(chunk: ByteArray) {
++        if (finished.get()) return
++        while (!queue.offer(chunk)) {
++            queue.poll() // Drop the oldest chunk to make room
++            if (finished.get()) return
++        }
++    }
++
++    /** Ends the stream. The consumer sees end-of-stream as soon as it asks for more data. */
++    fun finish() {
++        if (finished.compareAndSet(false, true)) {
++            queue.clear()
++            queue.offer(END_OF_STREAM)
++        }
++    }
++
++    override fun read(): Int {
++        val single = ByteArray(1)
++        return if (read(single, 0, 1) < 0) -1 else single[0].toInt() and 0xFF
++    }
++
++    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length == 0) return 0
++        if (reachedEnd) return -1
++
++        if (firstRead) {
++            // The consumer starts reading once the other phone has connected. Anything captured
++            // before that is stale, so skip it to keep the latency as low as possible.
++            firstRead = false
++            queue.clear()
++        }
++
++        if (position >= current.size) {
++            val next = try {
++                queue.take()
++            } catch (e: InterruptedException) {
++                Thread.currentThread().interrupt()
++                reachedEnd = true
++                return -1
++            }
++            if (next === END_OF_STREAM) {
++                reachedEnd = true
++                return -1
++            }
++            current = next
++            position = 0
++        }
++
++        val count = minOf(length, current.size - position)
++        System.arraycopy(current, position, buffer, offset, count)
++        position += count
++        return count
++    }
++
++    override fun close() {
++        finish()
++        onClosed()
++    }
++
++    private companion object {
++        // 50 chunks of 20 ms = at most one second of buffered audio
++        const val MAX_QUEUED_CHUNKS = 50
++        val EMPTY = ByteArray(0)
++        val END_OF_STREAM = ByteArray(0)
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt
+new file mode 100644
+index 0000000..f2646b6
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import android.content.ContentResolver
++import android.content.ContentValues
++import android.content.Context
++import android.media.MediaScannerConnection
++import android.net.Uri
++import android.os.Build
++import android.os.Environment
++import android.provider.MediaStore
++import android.webkit.MimeTypeMap
++import androidx.annotation.RequiresApi
++import java.io.File
++import java.io.FileOutputStream
++import java.io.IOException
++import java.io.OutputStream
++
++/**
++ * Where files downloaded from the other phone are saved: Downloads/KDE Connect, keeping the folder
++ * structure when a whole folder is downloaded.
++ *
++ * Android 10+ saves through the MediaStore, which needs no storage permission. Older versions write
++ * the file directly, which needs the storage permission.
++ */
++internal object LocalDownloads {
++
++    const val FOLDER_NAME = "KDE Connect"
++
++    /** An output stream whose file only becomes visible once [close] is called, and is deleted by [abort]. */
++    class Target(
++        private val out: OutputStream,
++        private val onFinish: () -> Unit,
++        private val onAbort: () -> Unit,
++    ) : OutputStream() {
++        private var done = false
++
++        override fun write(b: Int) = out.write(b)
++        override fun write(b: ByteArray, off: Int, len: Int) = out.write(b, off, len)
++        override fun flush() = out.flush()
++
++        override fun close() {
++            if (done) return
++            done = true
++            try {
++                out.close()
++            } finally {
++                onFinish()
++            }
++        }
++
++        /** Discards the partially written file. */
++        fun abort() {
++            if (done) return
++            done = true
++            runCatching { out.close() }
++            onAbort()
++        }
++    }
++
++    /** @param relativeDirectory a folder inside "KDE Connect", or empty for the folder itself. */
++    @Throws(IOException::class)
++    fun create(context: Context, fileName: String, relativeDirectory: String): Target {
++        val subPath = listOf(FOLDER_NAME, relativeDirectory).filter { it.isNotEmpty() }.joinToString("/")
++        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            createWithMediaStore(context.applicationContext, fileName, subPath)
++        } else {
++            createLegacy(context.applicationContext, fileName, subPath)
++        }
++    }
++
++    @RequiresApi(Build.VERSION_CODES.Q)
++    private fun createWithMediaStore(context: Context, fileName: String, subPath: String): Target {
++        val resolver: ContentResolver = context.contentResolver
++        val values = ContentValues().apply {
++            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
++            put(MediaStore.MediaColumns.MIME_TYPE, mimeTypeFor(fileName))
++            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$subPath")
++            put(MediaStore.MediaColumns.IS_PENDING, 1) // Hidden from other apps until it is complete
++        }
++        val uri: Uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
++            ?: throw IOException("Cannot create $fileName in Downloads")
++        val stream = try {
++            resolver.openOutputStream(uri) ?: throw IOException("Cannot write $fileName")
++        } catch (e: Exception) {
++            resolver.delete(uri, null, null)
++            throw if (e is IOException) e else IOException(e.message, e)
++        }
++        return Target(
++            out = stream,
++            onFinish = {
++                val published = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
++                resolver.update(uri, published, null, null)
++            },
++            onAbort = { resolver.delete(uri, null, null) },
++        )
++    }
++
++    @Suppress("DEPRECATION") // Direct access to the public Downloads folder is only needed before Android 10
++    private fun createLegacy(context: Context, fileName: String, subPath: String): Target {
++        val directory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subPath)
++        if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Cannot create ${directory.path}")
++
++        val file = uniqueFile(directory, fileName)
++        val stream = FileOutputStream(file)
++        return Target(
++            out = stream,
++            onFinish = { MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null) },
++            onAbort = { file.delete() },
++        )
++    }
++
++    private fun uniqueFile(directory: File, fileName: String): File {
++        var candidate = File(directory, fileName)
++        if (!candidate.exists()) return candidate
++
++        val base = fileName.substringBeforeLast('.', fileName)
++        val extension = fileName.substringAfterLast('.', "").let { if (it.isEmpty()) "" else ".$it" }
++        var counter = 1
++        while (candidate.exists()) {
++            candidate = File(directory, "$base ($counter)$extension")
++            counter++
++        }
++        return candidate
++    }
++
++    private fun mimeTypeFor(fileName: String): String {
++        val extension = fileName.substringAfterLast('.', "").lowercase()
++        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesActivity.kt
+new file mode 100644
+index 0000000..66473d1
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesActivity.kt
+@@ -0,0 +1,89 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import android.Manifest
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Bundle
++import android.widget.Toast
++import androidx.activity.addCallback
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.activity.viewModels
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.content.ContextCompat
++import org.kde.kdeconnect.ui.compose.KdeTheme
++import org.kde.kdeconnect_tp.R
++
++/**
++ * Lets the user browse the files of another paired device, and download, upload, rename and delete
++ * them. It talks to the SFTP server the other device runs for its Filesystem access plugin.
++ */
++class RemoteFilesActivity : AppCompatActivity() {
++
++    private val viewModel: RemoteFilesViewModel by viewModels()
++
++    private var pendingDownload: RemoteFile? = null
++
++    private val pickFiles = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
++        if (uris.isNotEmpty()) viewModel.upload(uris)
++    }
++
++    private val requestWritePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
++        val file = pendingDownload
++        pendingDownload = null
++        if (granted && file != null) {
++            viewModel.download(file)
++        } else if (!granted) {
++            Toast.makeText(this, R.string.files_storage_permission_needed, Toast.LENGTH_LONG).show()
++        }
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        enableEdgeToEdge()
++
++        val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
++        if (deviceId == null) {
++            finish()
++            return
++        }
++        viewModel.start(deviceId)
++
++        onBackPressedDispatcher.addCallback(this) {
++            if (!viewModel.goUp()) finish()
++        }
++
++        setContent {
++            KdeTheme(this) {
++                RemoteFilesScreen(
++                    viewModel = viewModel,
++                    onNavigateUp = { onBackPressedDispatcher.onBackPressed() },
++                    onDownload = ::downloadWithPermission,
++                    onUpload = { pickFiles.launch("*/*") },
++                )
++            }
++        }
++    }
++
++    private fun downloadWithPermission(file: RemoteFile) {
++        // Android 10+ saves downloads through the MediaStore, which needs no permission
++        val needsPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
++            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
++        if (needsPermission) {
++            pendingDownload = file
++            requestWritePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
++        } else {
++            viewModel.download(file)
++        }
++    }
++
++    companion object {
++        const val EXTRA_DEVICE_ID = "deviceId"
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesScreen.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesScreen.kt
+new file mode 100644
+index 0000000..f997c52
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesScreen.kt
+@@ -0,0 +1,345 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import android.text.format.Formatter
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Add
++import androidx.compose.material.icons.filled.MoreVert
++import androidx.compose.material.icons.filled.Refresh
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.DropdownMenu
++import androidx.compose.material3.DropdownMenuItem
++import androidx.compose.material3.FloatingActionButton
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.SnackbarHost
++import androidx.compose.material3.SnackbarHostState
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import org.kde.kdeconnect.ui.compose.KdeTopAppBar
++import org.kde.kdeconnect_tp.R
++import java.text.DateFormat
++import java.util.Date
++
++@Composable
++internal fun RemoteFilesScreen(
++    viewModel: RemoteFilesViewModel,
++    onNavigateUp: () -> Unit,
++    onDownload: (RemoteFile) -> Unit,
++    onUpload: () -> Unit,
++) {
++    val snackbarHostState = remember { SnackbarHostState() }
++    LaunchedEffect(viewModel) {
++        viewModel.messages.collect { snackbarHostState.showSnackbar(it) }
++    }
++
++    var renameTarget by remember { mutableStateOf<RemoteFile?>(null) }
++    var deleteTarget by remember { mutableStateOf<RemoteFile?>(null) }
++    var showNewFolderDialog by rememberSaveable { mutableStateOf(false) }
++
++    val isBrowsing = viewModel.phase == RemoteFilesViewModel.Phase.BROWSING
++    val insideFolder = isBrowsing && viewModel.currentPath != null
++
++    Scaffold(
++        topBar = {
++            KdeTopAppBar(
++                title = stringResource(R.string.files_title, viewModel.deviceName),
++                subTitle = viewModel.currentPath,
++                navIconDescription = stringResource(androidx.appcompat.R.string.abc_action_bar_up_description),
++                navIconOnClick = onNavigateUp,
++                actions = {
++                    if (isBrowsing) {
++                        if (insideFolder) {
++                            IconButton(onClick = { showNewFolderDialog = true }) {
++                                Icon(painterResource(R.drawable.ic_folder), stringResource(R.string.files_new_folder))
++                            }
++                        }
++                        IconButton(onClick = { if (insideFolder) viewModel.refresh() else viewModel.connect() }) {
++                            Icon(Icons.Default.Refresh, stringResource(R.string.refresh))
++                        }
++                    }
++                }
++            )
++        },
++        floatingActionButton = {
++            if (insideFolder) {
++                FloatingActionButton(onClick = onUpload) {
++                    Icon(Icons.Default.Add, stringResource(R.string.files_upload))
++                }
++            }
++        },
++        snackbarHost = { SnackbarHost(snackbarHostState) }
++    ) { innerPadding ->
++        Column(Modifier.fillMaxSize().padding(innerPadding)) {
++            val busy = viewModel.busyMessage
++            if (viewModel.isLoading || busy != null) {
++                LinearProgressIndicator(Modifier.fillMaxWidth())
++            }
++            if (busy != null) {
++                Text(
++                    busy,
++                    style = MaterialTheme.typography.bodySmall,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
++                )
++            }
++
++            when (viewModel.phase) {
++                RemoteFilesViewModel.Phase.CONNECTING -> CenteredMessage {
++                    CircularProgressIndicator()
++                    Text(stringResource(R.string.files_connecting), modifier = Modifier.padding(top = 16.dp))
++                }
++
++                RemoteFilesViewModel.Phase.ERROR -> CenteredMessage {
++                    Text(viewModel.errorMessage.orEmpty(), textAlign = TextAlign.Center)
++                    Button(onClick = viewModel::connect, modifier = Modifier.padding(top = 16.dp)) {
++                        Text(stringResource(R.string.files_retry))
++                    }
++                }
++
++                RemoteFilesViewModel.Phase.BROWSING -> {
++                    if (viewModel.currentPath == null) {
++                        RootsList(viewModel.roots, onOpen = viewModel::openFolder)
++                    } else {
++                        FileList(
++                            entries = viewModel.entries,
++                            isLoading = viewModel.isLoading,
++                            onOpenFolder = { viewModel.openFolder(it.path) },
++                            onDownload = onDownload,
++                            onRename = { renameTarget = it },
++                            onDelete = { deleteTarget = it },
++                        )
++                    }
++                }
++            }
++        }
++    }
++
++    if (showNewFolderDialog) {
++        NameDialog(
++            title = stringResource(R.string.files_new_folder),
++            initialName = "",
++            onConfirm = {
++                showNewFolderDialog = false
++                viewModel.createFolder(it)
++            },
++            onDismiss = { showNewFolderDialog = false }
++        )
++    }
++
++    renameTarget?.let { file ->
++        NameDialog(
++            title = stringResource(R.string.files_rename),
++            initialName = file.name,
++            onConfirm = {
++                renameTarget = null
++                viewModel.rename(file, it)
++            },
++            onDismiss = { renameTarget = null }
++        )
++    }
++
++    deleteTarget?.let { file ->
++        AlertDialog(
++            onDismissRequest = { deleteTarget = null },
++            title = { Text(stringResource(R.string.files_delete)) },
++            text = { Text(stringResource(R.string.files_delete_confirm, file.name)) },
++            confirmButton = {
++                TextButton(onClick = {
++                    deleteTarget = null
++                    viewModel.delete(file)
++                }) { Text(stringResource(R.string.files_delete)) }
++            },
++            dismissButton = {
++                TextButton(onClick = { deleteTarget = null }) { Text(stringResource(R.string.cancel)) }
++            }
++        )
++    }
++}
++
++@Composable
++private fun CenteredMessage(content: @Composable () -> Unit) {
++    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
++        Column(horizontalAlignment = Alignment.CenterHorizontally) { content() }
++    }
++}
++
++@Composable
++private fun RootsList(roots: List<RemoteSftpRoot>, onOpen: (String) -> Unit) {
++    LazyColumn(Modifier.fillMaxSize()) {
++        items(roots, key = { it.path }) { root ->
++            FileRow(
++                isDirectory = true,
++                name = root.name,
++                details = root.path,
++                onClick = { onOpen(root.path) },
++                menu = null,
++            )
++            HorizontalDivider()
++        }
++    }
++}
++
++@Composable
++private fun FileList(
++    entries: List<RemoteFile>,
++    isLoading: Boolean,
++    onOpenFolder: (RemoteFile) -> Unit,
++    onDownload: (RemoteFile) -> Unit,
++    onRename: (RemoteFile) -> Unit,
++    onDelete: (RemoteFile) -> Unit,
++) {
++    if (entries.isEmpty() && !isLoading) {
++        CenteredMessage { Text(stringResource(R.string.files_empty)) }
++        return
++    }
++
++    val context = LocalContext.current
++    val dateFormat = remember { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT) }
++
++    LazyColumn(Modifier.fillMaxSize()) {
++        items(entries, key = { it.path }) { file ->
++            val details = buildList {
++                if (!file.isDirectory) add(Formatter.formatShortFileSize(context, file.size))
++                if (file.modifiedMillis > 0) add(dateFormat.format(Date(file.modifiedMillis)))
++            }.joinToString(" · ")
++
++            FileRow(
++                isDirectory = file.isDirectory,
++                name = file.name,
++                details = details,
++                onClick = { if (file.isDirectory) onOpenFolder(file) else onDownload(file) },
++                menu = { dismiss ->
++                    DropdownMenuItem(
++                        text = { Text(stringResource(R.string.files_download)) },
++                        onClick = { dismiss(); onDownload(file) }
++                    )
++                    DropdownMenuItem(
++                        text = { Text(stringResource(R.string.files_rename)) },
++                        onClick = { dismiss(); onRename(file) }
++                    )
++                    DropdownMenuItem(
++                        text = { Text(stringResource(R.string.files_delete)) },
++                        onClick = { dismiss(); onDelete(file) }
++                    )
++                }
++            )
++            HorizontalDivider()
++        }
++    }
++}
++
++@Composable
++private fun FileRow(
++    isDirectory: Boolean,
++    name: String,
++    details: String,
++    onClick: () -> Unit,
++    menu: (@Composable (dismiss: () -> Unit) -> Unit)?,
++) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .clickable(onClick = onClick)
++            .padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = if (menu == null) 16.dp else 4.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(16.dp)
++    ) {
++        Icon(
++            painter = painterResource(if (isDirectory) R.drawable.ic_folder else R.drawable.ic_file),
++            contentDescription = null,
++            tint = if (isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Column(Modifier.weight(1f)) {
++            Text(name, style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
++            if (details.isNotEmpty()) {
++                Text(
++                    details,
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis
++                )
++            }
++        }
++        if (menu != null) {
++            var expanded by remember { mutableStateOf(false) }
++            Box {
++                IconButton(onClick = { expanded = true }) {
++                    Icon(Icons.Default.MoreVert, contentDescription = null)
++                }
++                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
++                    menu { expanded = false }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun NameDialog(
++    title: String,
++    initialName: String,
++    onConfirm: (String) -> Unit,
++    onDismiss: () -> Unit,
++) {
++    var name by rememberSaveable { mutableStateOf(initialName) }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(title) },
++        text = {
++            OutlinedTextField(
++                value = name,
++                onValueChange = { name = it },
++                label = { Text(stringResource(R.string.files_name)) },
++                singleLine = true,
++                modifier = Modifier.fillMaxWidth()
++            )
++        },
++        confirmButton = {
++            TextButton(onClick = { onConfirm(name) }, enabled = name.isNotBlank()) {
++                Text(stringResource(R.string.ok))
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
++        }
++    )
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesViewModel.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesViewModel.kt
+new file mode 100644
+index 0000000..b9a647b
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteFilesViewModel.kt
+@@ -0,0 +1,269 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import android.app.Application
++import android.net.Uri
++import android.provider.OpenableColumns
++import androidx.annotation.StringRes
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.lifecycle.AndroidViewModel
++import androidx.lifecycle.viewModelScope
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect.helpers.ThreadHelper
++import org.kde.kdeconnect_tp.R
++import java.io.IOException
++
++/**
++ * State and actions of the screen that browses the files of another device
++ * (see [RemoteFilesActivity]), on top of [RemoteSftpClient].
++ */
++class RemoteFilesViewModel(application: Application) : AndroidViewModel(application) {
++
++    enum class Phase { CONNECTING, ERROR, BROWSING }
++
++    var phase by mutableStateOf(Phase.CONNECTING)
++        private set
++    var errorMessage by mutableStateOf<String?>(null)
++        private set
++    var deviceName by mutableStateOf("")
++        private set
++
++    /** The storage locations of the other device (internal storage, SD card...). */
++    var roots by mutableStateOf<List<RemoteSftpRoot>>(emptyList())
++        private set
++
++    /** The folder being shown, or null when the list of [roots] is shown instead. */
++    var currentPath by mutableStateOf<String?>(null)
++        private set
++    var entries by mutableStateOf<List<RemoteFile>>(emptyList())
++        private set
++    var isLoading by mutableStateOf(false)
++        private set
++
++    /** Describes the download/upload/delete in progress, or null when idle. */
++    var busyMessage by mutableStateOf<String?>(null)
++        private set
++
++    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
++
++    /** One-off messages for the user (results and errors of the operations). */
++    val messages: SharedFlow<String> = _messages.asSharedFlow()
++
++    private var deviceId: String? = null
++    private var client: RemoteSftpClient? = null
++
++    // Folders we came from, so "back" goes up one level. A null entry stands for the list of roots.
++    private val history = ArrayList<String?>()
++
++    private fun string(@StringRes id: Int, vararg args: Any): String = getApplication<Application>().getString(id, *args)
++
++    fun start(deviceId: String) {
++        if (this.deviceId != null) return
++        this.deviceId = deviceId
++        connect()
++    }
++
++    fun connect() {
++        val id = deviceId ?: return
++        phase = Phase.CONNECTING
++        errorMessage = null
++        viewModelScope.launch {
++            try {
++                val device = KdeConnect.getInstance().getDevice(id)
++                    ?: throw IOException(string(R.string.files_connection_timeout))
++                deviceName = device.name
++                val plugin = device.getPlugin(SftpPlugin::class.java)
++                    ?: throw IOException(string(R.string.files_connection_timeout))
++
++                val session = plugin.requestRemoteSession()
++                val newClient = withContext(Dispatchers.IO) {
++                    RemoteSftpClient(session, device.certificate.publicKey).also { it.connect() }
++                }
++                closeClientInBackground()
++                client = newClient
++
++                roots = session.roots
++                history.clear()
++                currentPath = null
++                entries = emptyList()
++                phase = Phase.BROWSING
++                if (roots.size == 1) load(roots[0].path)
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                errorMessage = string(R.string.files_connection_failed, e.message ?: e.toString())
++                phase = Phase.ERROR
++            }
++        }
++    }
++
++    fun openFolder(path: String) {
++        history.add(currentPath)
++        load(path)
++    }
++
++    /** Goes up one level. Returns false if we are already at the top, so the screen should close. */
++    fun goUp(): Boolean {
++        if (phase != Phase.BROWSING || history.isEmpty()) return false
++        val previous = history.removeAt(history.lastIndex)
++        if (previous == null) {
++            currentPath = null
++            entries = emptyList()
++        } else {
++            load(previous)
++        }
++        return true
++    }
++
++    fun refresh() {
++        currentPath?.let { load(it) }
++    }
++
++    private fun load(path: String) {
++        val activeClient = client ?: return
++        currentPath = path
++        isLoading = true
++        viewModelScope.launch {
++            try {
++                val listing = withContext(Dispatchers.IO) { activeClient.list(path) }
++                if (currentPath == path) entries = listing
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                if (currentPath == path) entries = emptyList()
++                _messages.tryEmit(string(R.string.files_operation_failed, e.message ?: e.toString()))
++            } finally {
++                isLoading = false
++            }
++        }
++    }
++
++    fun download(file: RemoteFile) {
++        launchOperation(string(R.string.files_downloading, file.name), refreshAfterwards = false) { activeClient ->
++            if (file.isDirectory) {
++                for ((child, relativeDirectory) in activeClient.listRecursive(file)) {
++                    saveFile(activeClient, child, listOf(file.name, relativeDirectory).filter { it.isNotEmpty() }.joinToString("/"))
++                }
++            } else {
++                saveFile(activeClient, file, "")
++            }
++            string(R.string.files_downloaded, file.name)
++        }
++    }
++
++    private fun saveFile(activeClient: RemoteSftpClient, file: RemoteFile, relativeDirectory: String) {
++        val target = LocalDownloads.create(getApplication(), file.name, relativeDirectory)
++        try {
++            activeClient.openRead(file.path).use { input -> input.copyTo(target, COPY_BUFFER_SIZE) }
++            target.close()
++        } catch (e: Exception) {
++            target.abort()
++            throw e
++        }
++    }
++
++    fun upload(uris: List<Uri>) {
++        val directory = currentPath ?: return
++        val names = uris.map { displayName(it) }
++        val label = if (uris.size == 1) names[0] else uris.size.toString()
++        launchOperation(string(R.string.files_uploading, label), refreshAfterwards = true) { activeClient ->
++            val resolver = getApplication<Application>().contentResolver
++            uris.forEachIndexed { index, uri ->
++                val input = resolver.openInputStream(uri) ?: throw IOException(names[index])
++                input.use { source ->
++                    activeClient.openWrite(RemoteSftpClient.join(directory, names[index])).use { destination ->
++                        source.copyTo(destination, COPY_BUFFER_SIZE)
++                    }
++                }
++            }
++            string(R.string.files_uploaded, label)
++        }
++    }
++
++    fun rename(file: RemoteFile, newName: String) {
++        val name = newName.trim().replace('/', '_')
++        if (name.isEmpty() || name == file.name) return
++        val parent = file.path.substringBeforeLast('/', "").ifEmpty { "/" }
++        launchOperation(string(R.string.files_rename), refreshAfterwards = true) { activeClient ->
++            activeClient.rename(file.path, RemoteSftpClient.join(parent, name))
++            null
++        }
++    }
++
++    fun delete(file: RemoteFile) {
++        launchOperation(string(R.string.files_delete), refreshAfterwards = true) { activeClient ->
++            activeClient.delete(file)
++            null
++        }
++    }
++
++    fun createFolder(name: String) {
++        val directory = currentPath ?: return
++        val folderName = name.trim().replace('/', '_')
++        if (folderName.isEmpty()) return
++        launchOperation(string(R.string.files_new_folder), refreshAfterwards = true) { activeClient ->
++            activeClient.createDirectory(RemoteSftpClient.join(directory, folderName))
++            null
++        }
++    }
++
++    /** Runs [block] off the main thread while showing [busy], then reports its result (if any) to the user. */
++    private fun launchOperation(
++        busy: String,
++        refreshAfterwards: Boolean,
++        block: (RemoteSftpClient) -> String?,
++    ) {
++        val activeClient = client ?: return
++        viewModelScope.launch {
++            busyMessage = busy
++            try {
++                withContext(Dispatchers.IO) { block(activeClient) }?.let { _messages.tryEmit(it) }
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                _messages.tryEmit(string(R.string.files_operation_failed, e.message ?: e.toString()))
++            } finally {
++                busyMessage = null
++            }
++            if (refreshAfterwards) refresh()
++        }
++    }
++
++    private fun displayName(uri: Uri): String {
++        val resolver = getApplication<Application>().contentResolver
++        val fromProvider = runCatching {
++            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
++                if (cursor.moveToFirst()) cursor.getString(0) else null
++            }
++        }.getOrNull()
++        val name = fromProvider ?: uri.lastPathSegment?.substringAfterLast('/') ?: "file"
++        return name.replace('/', '_')
++    }
++
++    private fun closeClientInBackground() {
++        val old = client ?: return
++        client = null
++        ThreadHelper.runOnNewThread { old.close() }
++    }
++
++    override fun onCleared() {
++        closeClientInBackground()
++    }
++
++    private companion object {
++        const val COPY_BUFFER_SIZE = 64 * 1024
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt
+new file mode 100644
+index 0000000..6143d81
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt
+@@ -0,0 +1,218 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import org.apache.sshd.client.SshClient
++import org.apache.sshd.client.keyverifier.ServerKeyVerifier
++import org.apache.sshd.client.session.ClientSession
++import org.apache.sshd.sftp.client.SftpClient
++import org.apache.sshd.sftp.client.SftpClientFactory
++import java.io.Closeable
++import java.io.IOException
++import java.io.InputStream
++import java.io.OutputStream
++import java.security.PublicKey
++import java.security.interfaces.RSAPublicKey
++
++/** A top-level storage location shared by the other device (eg: "Internal storage"). */
++data class RemoteSftpRoot(val name: String, val path: String)
++
++/** Everything needed to connect to the SFTP server another device just started for us. */
++data class RemoteSftpSession(
++    val host: String,
++    val port: Int,
++    val user: String,
++    val password: String,
++    val roots: List<RemoteSftpRoot>,
++)
++
++data class RemoteFile(
++    val name: String,
++    val path: String,
++    val isDirectory: Boolean,
++    val size: Long,
++    val modifiedMillis: Long,
++)
++
++/**
++ * A client for the SFTP server that the other device exposes through its Filesystem access plugin.
++ *
++ * The connection is only accepted if the server proves it is the paired device: the SSH host key
++ * must match the device's public key, which KDE Connect already pinned when pairing.
++ *
++ * All methods block, so call them from a background thread.
++ */
++class RemoteSftpClient(
++    private val session: RemoteSftpSession,
++    private val trustedHostKey: PublicKey,
++) : Closeable {
++
++    private val lock = Any()
++    private var sshClient: SshClient? = null
++    private var clientSession: ClientSession? = null
++    private var browseClient: SftpClient? = null
++
++    @Throws(IOException::class)
++    fun connect() {
++        SimpleSftpServer.ensureSshdConfigured()
++        val ssh = SshClient.setUpDefaultClient()
++        ssh.serverKeyVerifier = ServerKeyVerifier { _, _, serverKey -> publicKeysMatch(serverKey, trustedHostKey) }
++        ssh.start()
++        sshClient = ssh
++
++        try {
++            val newSession = ssh.connect(session.user, session.host, session.port).verify(CONNECT_TIMEOUT_MS).session
++            clientSession = newSession
++            newSession.addPasswordIdentity(session.password)
++            newSession.auth().verify(AUTH_TIMEOUT_MS)
++            browseClient = SftpClientFactory.instance().createSftpClient(newSession)
++        } catch (e: Exception) {
++            close()
++            throw if (e is IOException) e else IOException(e.message, e)
++        }
++    }
++
++    @Throws(IOException::class)
++    fun list(path: String): List<RemoteFile> = withBrowseClient { sftp ->
++        val result = ArrayList<RemoteFile>()
++        for (entry in sftp.readDir(path)) {
++            val name = entry.filename
++            if (name == "." || name == "..") continue
++            val fullPath = join(path, name)
++
++            var attributes = entry.attributes
++            if (attributes.isSymbolicLink) {
++                // Show what the link points to, not the link itself
++                attributes = runCatching { sftp.stat(fullPath) }.getOrDefault(attributes)
++            }
++            val modified = runCatching { attributes.modifyTime.toMillis() }.getOrDefault(0L)
++            result.add(RemoteFile(name, fullPath, attributes.isDirectory, attributes.size, modified))
++        }
++        result.sortedWith(compareBy<RemoteFile>({ !it.isDirectory }, { it.name.lowercase() }))
++    }
++
++    @Throws(IOException::class)
++    fun createDirectory(path: String) {
++        withBrowseClient { it.mkdir(path) }
++    }
++
++    @Throws(IOException::class)
++    fun rename(oldPath: String, newPath: String) {
++        withBrowseClient { it.rename(oldPath, newPath) }
++    }
++
++    /** Deletes a file, or a folder with everything inside. */
++    @Throws(IOException::class)
++    fun delete(file: RemoteFile) {
++        if (file.isDirectory) {
++            for (child in list(file.path)) delete(child)
++            withBrowseClient { it.rmdir(file.path) }
++        } else {
++            withBrowseClient { it.remove(file.path) }
++        }
++    }
++
++    /** Lists a folder and everything in its subfolders, as (file, path relative to [directory]). */
++    @Throws(IOException::class)
++    fun listRecursive(directory: RemoteFile): List<Pair<RemoteFile, String>> {
++        val result = ArrayList<Pair<RemoteFile, String>>()
++        fun walk(dir: RemoteFile, relative: String) {
++            for (child in list(dir.path)) {
++                if (child.isDirectory) {
++                    walk(child, if (relative.isEmpty()) child.name else "$relative/${child.name}")
++                } else {
++                    result.add(child to relative)
++                }
++            }
++        }
++        walk(directory, "")
++        return result
++    }
++
++    /** Opens a file for reading. It uses its own SFTP channel, so it doesn't block browsing. */
++    @Throws(IOException::class)
++    fun openRead(path: String): InputStream {
++        val sftp = newSftpClient()
++        val stream = try {
++            sftp.read(path)
++        } catch (e: Exception) {
++            sftp.close()
++            throw e
++        }
++        return object : InputStream() {
++            override fun read(): Int = stream.read()
++            override fun read(b: ByteArray, off: Int, len: Int): Int = stream.read(b, off, len)
++            override fun available(): Int = stream.available()
++            override fun close() {
++                try {
++                    stream.close()
++                } finally {
++                    sftp.close()
++                }
++            }
++        }
++    }
++
++    /** Opens a file for writing (creating or overwriting it). Close the stream to finish the upload. */
++    @Throws(IOException::class)
++    fun openWrite(path: String): OutputStream {
++        val sftp = newSftpClient()
++        val stream = try {
++            sftp.write(path)
++        } catch (e: Exception) {
++            sftp.close()
++            throw e
++        }
++        return object : OutputStream() {
++            override fun write(b: Int) = stream.write(b)
++            override fun write(b: ByteArray, off: Int, len: Int) = stream.write(b, off, len)
++            override fun flush() = stream.flush()
++            override fun close() {
++                try {
++                    stream.close()
++                } finally {
++                    sftp.close()
++                }
++            }
++        }
++    }
++
++    override fun close() {
++        synchronized(lock) {
++            runCatching { browseClient?.close() }
++            browseClient = null
++        }
++        runCatching { clientSession?.close(false) }
++        clientSession = null
++        runCatching { sshClient?.stop() }
++        sshClient = null
++    }
++
++    private fun newSftpClient(): SftpClient {
++        val current = clientSession ?: throw IOException("Not connected")
++        return SftpClientFactory.instance().createSftpClient(current)
++    }
++
++    private fun <T> withBrowseClient(block: (SftpClient) -> T): T = synchronized(lock) {
++        val sftp = browseClient ?: throw IOException("Not connected")
++        block(sftp)
++    }
++
++    companion object {
++        private const val CONNECT_TIMEOUT_MS = 15_000L
++        private const val AUTH_TIMEOUT_MS = 15_000L
++
++        fun join(directory: String, name: String): String =
++            if (directory.endsWith("/")) "$directory$name" else "$directory/$name"
++
++        private fun publicKeysMatch(a: PublicKey, b: PublicKey): Boolean {
++            if (a is RSAPublicKey && b is RSAPublicKey) {
++                return a.modulus == b.modulus && a.publicExponent == b.publicExponent
++            }
++            return a == b || a.encoded.contentEquals(b.encoded)
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt
+index 29ef572..239c3aa 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt
+@@ -6,16 +6,22 @@
+  */
+ package org.kde.kdeconnect.plugins.sftp
+ 
++import android.Manifest
+ import android.app.Activity
+ import android.content.ContentResolver
++import android.content.Intent
+ import android.content.SharedPreferences
+ import android.content.SharedPreferences.OnSharedPreferenceChangeListener
+ import android.net.Uri
++import android.os.Build
+ import android.os.Environment
+ import android.os.storage.StorageManager
+ import android.provider.Settings
+ import androidx.core.content.getSystemService
+ import androidx.core.net.toUri
++import androidx.fragment.app.DialogFragment
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.withTimeoutOrNull
+ import kotlinx.serialization.SerialName
+ import kotlinx.serialization.Serializable
+ import kotlinx.serialization.SerializationException
+@@ -24,12 +30,12 @@ import org.kde.kdeconnect.helpers.JsonHelper.json
+ import org.kde.kdeconnect.helpers.getLocalIpAddress
+ import org.kde.kdeconnect.plugins.Plugin
+ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
+-import org.kde.kdeconnect.ui.AlertDialogFragment
+-import org.kde.kdeconnect.ui.DeviceSettingsAlertDialogFragment
+ import org.kde.kdeconnect.ui.PluginSettingsFragment
+ import org.kde.kdeconnect.ui.StartActivityAlertDialogFragment
+ import org.kde.kdeconnect_tp.BuildConfig
+ import org.kde.kdeconnect_tp.R
++import java.io.File
++import java.io.IOException
+ import java.nio.file.Path
+ 
+ @LoadablePlugin
+@@ -40,16 +46,30 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+     override val description: String
+         get() = context.resources.getString(R.string.pref_plugin_sftp_desc)
+ 
++    // Android 11+ has a dedicated "All files access" permission. Before that, the regular storage
++    // permissions already give access to the whole shared storage.
++    private val usesAllFilesAccess: Boolean
++        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
++
++    override val requiredPermissions: Array<String>
++        get() = if (usesAllFilesAccess) {
++            emptyArray()
++        } else {
++            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE)
++        }
++
++    override val permissionExplanation: Int = R.string.sftp_storage_permission_explanation
++
+     override fun checkRequiredPermissions(): Boolean {
+-        return if (SimpleSftpServer.SUPPORTS_NATIVEFS) {
++        return if (usesAllFilesAccess) {
+             Environment.isExternalStorageManager()
+         } else {
+-            SftpSettingsFragment.getStorageInfoList(context, this).isNotEmpty()
++            arePermissionsGranted(requiredPermissions)
+         }
+     }
+ 
+-    override val permissionExplanationDialog: AlertDialogFragment
+-        get() = if (SimpleSftpServer.SUPPORTS_NATIVEFS) {
++    override val permissionExplanationDialog: DialogFragment
++        get() = if (usesAllFilesAccess) {
+             StartActivityAlertDialogFragment.Builder()
+                 .setTitle(displayName)
+                 .setMessage(R.string.sftp_manage_storage_permission_explanation)
+@@ -60,14 +80,7 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+                 .setReloadPluginsOnResult(true)
+                 .create()
+         } else {
+-            DeviceSettingsAlertDialogFragment.Builder()
+-                .setTitle(displayName)
+-                .setMessage(R.string.sftp_saf_permission_explanation)
+-                .setPositiveButton(R.string.ok)
+-                .setNegativeButton(R.string.cancel)
+-                .setDeviceId(device.deviceId)
+-                .setPluginKey(pluginKey)
+-                .create()
++            super.permissionExplanationDialog
+         }
+ 
+     override fun onCreate() {
+@@ -84,6 +97,9 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+     override fun loadPluginWhenRequiredPermissionsMissing() = true
+ 
+     override fun onPacketReceived(np: NetworkPacket): Boolean {
++        // The other device answering a request of ours to browse its files
++        if (np.type == PACKET_TYPE_SFTP) return handleRemoteSessionPacket(np)
++
+         if (!np.getBoolean("startBrowsing")) return false
+ 
+         if (!checkRequiredPermissions()) {
+@@ -102,10 +118,8 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+         val pathNames = mutableListOf<String>()
+ 
+         if (SimpleSftpServer.SUPPORTS_NATIVEFS) {
+-            val storageManager = context.getSystemService<StorageManager>()!!
+-            for (sv in storageManager.storageVolumes) {
+-                val directory = sv.directory ?: continue
+-                pathNames.add(sv.getDescription(context))
++            for ((name, directory) in nativeStorageRoots()) {
++                pathNames.add(name)
+                 paths.add(directory.path)
+             }
+             if (paths.isEmpty()) {
+@@ -221,9 +235,87 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+         }
+     }
+ 
+-    override val supportedPacketTypes: Array<String> = arrayOf(PACKET_TYPE_SFTP_REQUEST)
++    /**
++     * The storage locations this device shares with the others: internal storage and SD cards.
++     */
++    private fun nativeStorageRoots(): List<Pair<String, File>> {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            val storageManager = context.getSystemService<StorageManager>()!!
++            return storageManager.storageVolumes.mapNotNull { volume ->
++                volume.directory?.let { volume.getDescription(context) to it }
++            }
++        }
++
++        // Android 10 and older: the storage permissions give access to the whole shared storage
++        @Suppress("DEPRECATION")
++        val roots = mutableListOf(context.getString(R.string.sftp_internal_storage) to Environment.getExternalStorageDirectory())
++        // The first entry is internal storage. For removable volumes, the root is found by trimming
++        // the app-specific folder Android creates on them.
++        context.getExternalFilesDirs(null).drop(1).filterNotNull().forEachIndexed { index, dir ->
++            val marker = dir.absolutePath.indexOf("/Android/data")
++            if (marker > 0) {
++                roots.add(context.getString(R.string.sftp_sd_card, index + 1) to File(dir.absolutePath.substring(0, marker)))
++            }
++        }
++        return roots
++    }
++
++    // -- Browsing the files of the other device -------------------------------------------------
++
++    @Volatile
++    private var pendingRemoteSession: CompletableDeferred<RemoteSftpSession>? = null
++
++    /**
++     * Asks the other device to start its SFTP server and waits for the credentials it sends back.
++     *
++     * @throws IOException if the other device reports an error or doesn't answer in time.
++     */
++    @Throws(IOException::class)
++    suspend fun requestRemoteSession(): RemoteSftpSession {
++        val deferred = CompletableDeferred<RemoteSftpSession>()
++        pendingRemoteSession = deferred
++        try {
++            device.sendPacket(NetworkPacket(PACKET_TYPE_SFTP_REQUEST).apply { this["startBrowsing"] = true })
++            return withTimeoutOrNull(REMOTE_SESSION_TIMEOUT_MS) { deferred.await() }
++                ?: throw IOException(context.getString(R.string.files_connection_timeout))
++        } finally {
++            if (pendingRemoteSession === deferred) pendingRemoteSession = null
++        }
++    }
++
++    private fun handleRemoteSessionPacket(np: NetworkPacket): Boolean {
++        val pending = pendingRemoteSession ?: return false
++
++        np.getStringOrNull("errorMessage")?.let { message ->
++            pending.completeExceptionally(IOException(message))
++            return true
++        }
++
++        val host = np.getStringOrNull("ip")
++        val port = np.getInt("port", -1)
++        val password = np.getStringOrNull("password")
++        // Other packets of this type (eg: "serverRunning" notifications) carry no credentials
++        if (host == null || port <= 0 || password == null) return false
++
++        val paths = np.getStringList("multiPaths") ?: listOf(np.getString("path", "/"))
++        val names = np.getStringList("pathNames")
++        val roots = paths.mapIndexed { index, path -> RemoteSftpRoot(names?.getOrNull(index) ?: path, path) }
++        pending.complete(RemoteSftpSession(host, port, np.getString("user", SimpleSftpServer.USER), password, roots))
++        return true
++    }
++
++    override fun getUiButtons(): List<PluginUiButton> = listOf(
++        PluginUiButton(context.getString(R.string.files_browse), R.drawable.ic_folder) { activity ->
++            activity.startActivity(
++                Intent(activity, RemoteFilesActivity::class.java)
++                    .putExtra(RemoteFilesActivity.EXTRA_DEVICE_ID, device.deviceId)
++            )
++        }
++    )
++
++    override val supportedPacketTypes: Array<String> = arrayOf(PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SFTP)
+ 
+-    override val outgoingPacketTypes: Array<String> = arrayOf(PACKET_TYPE_SFTP)
++    override val outgoingPacketTypes: Array<String> = arrayOf(PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST)
+ 
+     override fun hasSettings(): Boolean = !SimpleSftpServer.SUPPORTS_NATIVEFS
+ 
+@@ -276,6 +368,7 @@ class SftpPlugin : Plugin(), OnSharedPreferenceChangeListener {
+     companion object {
+         private const val PACKET_TYPE_SFTP = "kdeconnect.sftp"
+         private const val PACKET_TYPE_SFTP_REQUEST = "kdeconnect.sftp.request"
++        private const val REMOTE_SESSION_TIMEOUT_MS = 20_000L
+ 
+         val PREFERENCE_KEY_STORAGE_INFO_LIST: Int = R.string.sftp_preference_key_storage_info_list
+ 
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/SimpleSftpServer.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/SimpleSftpServer.kt
+index 841662f..89a6f8b 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/sftp/SimpleSftpServer.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/SimpleSftpServer.kt
+@@ -265,11 +265,20 @@ internal class SimpleSftpServer {
+     companion object {
+         private const val TAG = "SimpleSftpServer"
+ 
+-        val SUPPORTS_NATIVEFS = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
++        // The whole shared storage is exposed on every Android version: through the "All files access"
++        // permission on Android 11+, and through the regular storage permissions before that.
++        // The per-folder (SAF) mode this used to fall back to on older versions is no longer used.
++        val SUPPORTS_NATIVEFS = true
+ 
+         private val PORT_RANGE = 1739..1764
+         const val USER: String = "kdeconnect"
+ 
++        /**
++         * Makes sure the Android-specific SSHD settings of the init block below are applied. They are
++         * global, so [RemoteSftpClient] needs them too, even if the server was never started.
++         */
++        fun ensureSshdConfigured() {}
++
+         init {
+             System.setProperty(SECURITY_PROVIDER_REGISTRARS, "") // disable BouncyCastle
+             System.setProperty(
+diff --git a/src/main/res/drawable/ic_file.xml b/src/main/res/drawable/ic_file.xml
+new file mode 100644
+index 0000000..afb87d8
+--- /dev/null
++++ b/src/main/res/drawable/ic_file.xml
+@@ -0,0 +1,14 @@
++<!--
++  ~ SPDX-FileCopyrightText: 2026 KDE Connect contributors
++  ~
++  ~ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++  -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#000000"
++        android:pathData="M14,2H6C4.9,2 4.01,2.9 4.01,4L4,20c0,1.1 0.89,2 1.99,2H18c1.1,0 2,-0.9 2,-2V8l-6,-6zM13,9V3.5L18.5,9H13z"/>
++</vector>
+diff --git a/src/main/res/drawable/ic_folder.xml b/src/main/res/drawable/ic_folder.xml
+new file mode 100644
+index 0000000..c9ee66c
+--- /dev/null
++++ b/src/main/res/drawable/ic_folder.xml
+@@ -0,0 +1,14 @@
++<!--
++  ~ SPDX-FileCopyrightText: 2026 KDE Connect contributors
++  ~
++  ~ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++  -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#000000"
++        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
++</vector>
+diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
+index d8b7391..29745db 100644
+--- a/src/main/res/values/strings.xml
++++ b/src/main/res/values/strings.xml
+@@ -671,4 +671,47 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
+ 
+     <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
++
++    <!-- Audio streaming plugin -->
++    <string name="pref_plugin_audiostream">Audio streaming</string>
++    <string name="pref_plugin_audiostream_desc">Play this device\'s audio on another device, or the other way around</string>
++    <string name="audiostream_send_here">Send this phone\'s audio here</string>
++    <string name="audiostream_listen">Play its audio on this phone</string>
++    <string name="audiostream_stop">Stop audio streaming</string>
++    <string name="audiostream_notification_title">Sharing audio with %1$s</string>
++    <string name="audiostream_notification_stop">Stop</string>
++    <string name="audiostream_request_title">%1$s wants to hear this phone\'s audio</string>
++    <string name="audiostream_request_text">Tap to start sharing. If the sound is silent, share the entire screen.</string>
++    <string name="audiostream_waiting">Waiting for %1$s to start sharing its audio…</string>
++    <string name="audiostream_playing">Playing the audio of %1$s</string>
++    <string name="audiostream_open_app_hint">%1$s wants this phone\'s audio. Open KDE Connect and use \"Send this phone\'s audio here\".</string>
++    <string name="audiostream_unsupported">Sharing audio needs Android 10 or newer</string>
++    <string name="audiostream_unsupported_remote">%1$s can\'t share its audio: it needs Android 10 or newer</string>
++    <string name="audiostream_permission_denied">Microphone permission is required to capture audio</string>
++    <string name="audiostream_consent_denied">Audio sharing was not allowed</string>
++
++    <!-- Browsing the files of another device -->
++    <string name="files_browse">Browse its files</string>
++    <string name="files_title">Files on %1$s</string>
++    <string name="files_connecting">Connecting…</string>
++    <string name="files_connection_timeout">The other device did not answer. Make sure KDE Connect is open there and it has file access.</string>
++    <string name="files_connection_failed">Could not connect: %1$s</string>
++    <string name="files_retry">Retry</string>
++    <string name="files_empty">This folder is empty</string>
++    <string name="files_download">Download</string>
++    <string name="files_rename">Rename</string>
++    <string name="files_delete">Delete</string>
++    <string name="files_upload">Upload files here</string>
++    <string name="files_new_folder">New folder</string>
++    <string name="files_name">Name</string>
++    <string name="files_delete_confirm">Delete %1$s from the other device? This cannot be undone.</string>
++    <string name="files_downloading">Downloading %1$s…</string>
++    <string name="files_downloaded">Saved to Downloads/KDE Connect: %1$s</string>
++    <string name="files_uploading">Uploading %1$s…</string>
++    <string name="files_uploaded">Uploaded %1$s</string>
++    <string name="files_operation_failed">Failed: %1$s</string>
++    <string name="files_storage_permission_needed">Allow storage access to save downloads</string>
++    <string name="sftp_internal_storage">Internal storage</string>
++    <string name="sftp_sd_card">SD card %1$d</string>
++    <string name="sftp_storage_permission_explanation">To share all files on this device with your other devices, KDE Connect needs access to storage.</string>
+ </resources>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStreamTest.kt b/src/test/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStreamTest.kt
+new file mode 100644
+index 0000000..422a85f
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/audiostream/PcmPipeInputStreamTest.kt
+@@ -0,0 +1,77 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.audiostream
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.util.concurrent.atomic.AtomicInteger
++
++class PcmPipeInputStreamTest {
++
++    // The first read throws away whatever was captured before the consumer connected, so tests
++    // consume it with a tiny priming chunk first.
++    private fun primed(): PcmPipeInputStream {
++        val pipe = PcmPipeInputStream {}
++        val primer = Thread { pipe.read(ByteArray(1), 0, 1) }
++        primer.start()
++        Thread.sleep(100)
++        pipe.push(byteArrayOf(0))
++        primer.join(2000)
++        return pipe
++    }
++
++    @Test
++    fun readsPushedChunksInOrder() {
++        val pipe = primed()
++        pipe.push(byteArrayOf(1, 2, 3))
++        pipe.push(byteArrayOf(4, 5))
++
++        val buffer = ByteArray(8)
++        assertEquals(3, pipe.read(buffer, 0, 8))
++        assertArrayEquals(byteArrayOf(1, 2, 3), buffer.copyOf(3))
++        assertEquals(2, pipe.read(buffer, 0, 8))
++        assertArrayEquals(byteArrayOf(4, 5), buffer.copyOf(2))
++    }
++
++    @Test
++    fun largeChunkIsSplitAcrossReads() {
++        val pipe = primed()
++        pipe.push(byteArrayOf(1, 2, 3))
++
++        val buffer = ByteArray(2)
++        assertEquals(2, pipe.read(buffer, 0, 2))
++        assertArrayEquals(byteArrayOf(1, 2), buffer)
++        assertEquals(1, pipe.read(buffer, 0, 2))
++        assertEquals(3, buffer[0].toInt())
++    }
++
++    @Test
++    fun finishEndsTheStream() {
++        val pipe = PcmPipeInputStream {}
++        pipe.finish()
++        assertEquals(-1, pipe.read(ByteArray(4), 0, 4))
++        assertEquals(-1, pipe.read(ByteArray(4), 0, 4))
++    }
++
++    @Test
++    fun closeNotifiesOwnerAndEndsTheStream() {
++        val closed = AtomicInteger()
++        val pipe = PcmPipeInputStream { closed.incrementAndGet() }
++        pipe.close()
++        assertEquals(1, closed.get())
++        assertEquals(-1, pipe.read(ByteArray(4), 0, 4))
++    }
++
++    @Test
++    fun pushNeverBlocksWhenNobodyReads() {
++        val pipe = PcmPipeInputStream {}
++        val start = System.nanoTime()
++        repeat(10_000) { pipe.push(ByteArray(960)) }
++        assertTrue("push must not block", (System.nanoTime() - start) / 1_000_000 < 2000)
++    }
++}
