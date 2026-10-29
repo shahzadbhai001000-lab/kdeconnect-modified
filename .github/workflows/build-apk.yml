@@ -1,0 +1,46 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get this repo (contains the patch)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+      - name: Get the original KDE Connect source
+        run: |
+          git clone https://github.com/KDE/kdeconnect-android.git src
+          cd src
+          git checkout bc38ff624f2674a10fc8c9392d7d058f7ced6f6f
+          git apply --whitespace=nowarn ../mine/kdeconnect-audio-and-files.patch
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install Android platform 37
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: src
+      - name: Build debug APK
+        working-directory: src
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Collect APK
+        run: cp src/build/outputs/apk/debug/*.apk kdeconnect-modified.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kdeconnect-modified
+          path: kdeconnect-modified.apk
+      - name: Publish as a downloadable release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Modified KDE Connect (build ${{ github.run_number }})
+          files: kdeconnect-modified.apk
