@@ -886,10 +886,10 @@ index 00000000..f8ad89ee
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt
 new file mode 100644
-index 00000000..13c2f94b
+index 00000000..f5e25daf
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,282 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -931,7 +931,7 @@ index 00000000..13c2f94b
 +
 +    private const val LOG_TAG = "RemoteTouchInjector"
 +    private const val CHUNK_MS = 50L
-+    private const val TAP_MS = 45L
++    private const val TAP_MS = 60L
 +    private const val STUCK_AFTER_MS = 1500L
 +    private const val MAX_QUEUED_SHOTS = 20
 +
@@ -941,9 +941,13 @@ index 00000000..13c2f94b
 +    }
 +
 +    /** A gesture that is already complete: points in pixels and how long it takes. */
-+    private class OneShot(val points: List<Pair<Float, Float>>, val durationMs: Long)
++    private class OneShot(val points: List<Pair<Float, Float>>, val durationMs: Long, val label: String)
 +
 +    private val handler = Handler(Looper.getMainLooper())
++
++    /** Told how each tap and swipe went ("tap ok 70ms", "swipe cancelled"...), to help find problems. */
++    @Volatile
++    var onResult: ((String) -> Unit)? = null
 +
 +    // All of the state below is only touched on the main thread
 +    private val pointers = LinkedHashMap<Int, Pointer>()
@@ -959,7 +963,7 @@ index 00000000..13c2f94b
 +    fun tap(x: Float, y: Float) {
 +        handler.post {
 +            val size = screenSize() ?: return@post
-+            enqueue(OneShot(listOf(x.coerceIn(0f, 1f) * size.first to y.coerceIn(0f, 1f) * size.second), TAP_MS))
++            enqueue(OneShot(listOf(x.coerceIn(0f, 1f) * size.first to y.coerceIn(0f, 1f) * size.second), TAP_MS, "tap"))
 +        }
 +    }
 +
@@ -969,7 +973,7 @@ index 00000000..13c2f94b
 +        handler.post {
 +            val size = screenSize() ?: return@post
 +            val pixels = points.map { it.first.coerceIn(0f, 1f) * size.first to it.second.coerceIn(0f, 1f) * size.second }
-+            enqueue(OneShot(pixels, durationMs.coerceIn(1L, 2000L)))
++            enqueue(OneShot(pixels, durationMs.coerceIn(1L, 2000L), "swipe"))
 +        }
 +    }
 +
@@ -1083,7 +1087,7 @@ index 00000000..13c2f94b
 +        val gesture = GestureDescription.Builder()
 +            .addStroke(GestureDescription.StrokeDescription(path, 0, shot.durationMs))
 +            .build()
-+        send(service, gesture, clearLiveOnCancel = false)
++        send(service, gesture, clearLiveOnCancel = false, label = shot.label)
 +    }
 +
 +    /** Sends the next short piece of every finger that is down. Runs again when it completes. */
@@ -1111,21 +1115,28 @@ index 00000000..13c2f94b
 +        }
 +        if (count == 0) return
 +
-+        if (send(service, builder.build(), clearLiveOnCancel = true)) {
++        if (send(service, builder.build(), clearLiveOnCancel = true, label = null)) {
 +            finished.forEach { pointers.remove(it) }
 +        }
 +    }
 +
 +    /** @return false if Android refused the gesture */
-+    private fun send(service: KdeConnectAccessibilityService, gesture: GestureDescription, clearLiveOnCancel: Boolean): Boolean {
++    private fun send(
++        service: KdeConnectAccessibilityService,
++        gesture: GestureDescription,
++        clearLiveOnCancel: Boolean,
++        label: String?,
++    ): Boolean {
 +        val callback = object : AccessibilityService.GestureResultCallback() {
 +            override fun onCompleted(gestureDescription: GestureDescription?) {
 +                dispatching = false
++                label?.let { onResult?.invoke("$it ok ${SystemClock.uptimeMillis() - dispatchedAt}ms") }
 +                pump(service)
 +            }
 +
 +            override fun onCancelled(gestureDescription: GestureDescription?) {
 +                dispatching = false
++                label?.let { onResult?.invoke("$it cancelled") }
 +                // The chain of live strokes is broken: the next touch starts fresh
 +                if (clearLiveOnCancel) pointers.clear()
 +                pump(service)
@@ -1141,6 +1152,7 @@ index 00000000..13c2f94b
 +        }
 +        if (!accepted) {
 +            dispatching = false
++            label?.let { onResult?.invoke("$it rejected") }
 +            if (clearLiveOnCancel) pointers.clear()
 +        }
 +        return accepted
@@ -1655,10 +1667,10 @@ index 00000000..e2de87b9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..764524d8
+index 00000000..4c466a42
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,374 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1865,6 +1877,7 @@ index 00000000..764524d8
 +            ACTION_BITRATE -> ScreenShareState.setBitrateIfSharingWith(device.deviceId, np.getInt("bitrate", 0))
 +            ACTION_PING -> device.sendPacket(request(ACTION_PONG).apply { this["ts"] = np.getLong("ts", 0L) })
 +            ACTION_PONG -> ScreenShareState.lastRttMs = maxOf(0L, System.currentTimeMillis() - np.getLong("ts", 0L))
++            ACTION_GESTURE_RESULT -> ScreenShareState.lastGestureResult = np.getString("text", "-")
 +            ACTION_CONTROL_UNAVAILABLE -> toast(R.string.screenshare_control_unavailable, device.name)
 +            else -> return false
 +        }
@@ -1886,6 +1899,11 @@ index 00000000..764524d8
 +                toast(R.string.screenshare_control_needs_accessibility)
 +            }
 +            return true
++        }
++
++        // Tell the viewer how each tap and swipe went (it is shown in the speed readout)
++        RemoteTouchInjector.onResult = { text ->
++            device.sendPacket(request(ACTION_GESTURE_RESULT).apply { this["text"] = text })
 +        }
 +
 +        when (np.getString("kind")) {
@@ -2015,6 +2033,7 @@ index 00000000..764524d8
 +        private const val ACTION_PING = "ping"
 +        private const val ACTION_PONG = "pong"
 +        private const val ACTION_CONTROL_UNAVAILABLE = "control_unavailable"
++        private const val ACTION_GESTURE_RESULT = "gesture_result"
 +
 +        private const val KIND_TOUCH = "touch"
 +        private const val KIND_TAP = "tap"
@@ -2110,10 +2129,10 @@ index 00000000..36c0288d
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
 new file mode 100644
-index 00000000..8c211c93
+index 00000000..7d6a9876
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,83 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2188,6 +2207,10 @@ index 00000000..8c211c93
 +
 +    @Synchronized
 +    fun takePending(): Pair<StreamHeader, NetworkPacket.Payload>? = pending.also { pending = null }
++
++    /** How the last tap or swipe went on the other phone, for the speed readout. */
++    @Volatile
++    var lastGestureResult: String = "-"
 +
 +    /** Last measured round trip to the other phone, in milliseconds, or -1. */
 +    @Volatile
@@ -2413,10 +2436,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..0a8b4694
+index 00000000..a2284580
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,399 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2734,7 +2757,8 @@ index 00000000..0a8b4694
 +            "%.0f kbps".format(bitsPerSecond / 1000)
 +        }
 +        val ping = ScreenShareState.lastRttMs.let { if (it >= 0) "$it ms" else "-- ms" }
-+        statsView.text = "$speed | %.0f fps | $ping | ${header.width}x${header.height}".format(fps)
++        statsView.text = "$speed | %.0f fps | $ping | ${header.width}x${header.height}".format(fps) +
++            "\nsent: ${touchSender.lastSent} | phone: ${ScreenShareState.lastGestureResult}"
 +    }
 +
 +    // -- Settings -----------------------------------------------------------------------------
@@ -2817,10 +2841,10 @@ index 00000000..0a8b4694
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
 new file mode 100644
-index 00000000..7279e853
+index 00000000..d03eb5d8
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,219 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2869,6 +2893,11 @@ index 00000000..7279e853
 +    private var firstPointerId = -1
 +
 +    private var lastMoveSentAt = 0L
++
++    /** What was last sent to the other phone, shown in the speed readout to help find problems. */
++    @Volatile
++    var lastSent: String = "-"
++        private set
 +    private val swipePoints = ArrayList<Pair<Float, Float>>()
 +
 +    // Every finger currently down: id to (x, y), both between 0 and 1
@@ -2962,10 +2991,14 @@ index 00000000..7279e853
 +        handler.removeCallbacks(goLiveRunnable)
 +        val id = event.getPointerId(event.actionIndex)
 +        when (state) {
-+            State.PENDING -> plugin()?.sendTap(startX, startY)
++            State.PENDING -> {
++                lastSent = "tap"
++                plugin()?.sendTap(startX, startY)
++            }
 +            State.SWIPING -> {
 +                addSwipePoint()
 +                val duration = (event.eventTime - startTime).coerceIn(MIN_SWIPE_MS, MAX_SWIPE_MS)
++                lastSent = "swipe ${swipePoints.size}pts ${duration}ms"
 +                plugin()?.sendSwipe(swipeText(), duration.toInt())
 +            }
 +            State.LIVE -> plugin()?.sendTouch("up", id, pointsText(), null, null)
@@ -2983,6 +3016,7 @@ index 00000000..7279e853
 +    private fun goLive() {
 +        if (state != State.PENDING && state != State.SWIPING) return
 +        state = State.LIVE
++        lastSent = "hold"
 +        sendDown(firstPointerId, startX, startY)
 +    }
 +
@@ -3015,15 +3049,18 @@ index 00000000..7279e853
 +    private fun format(id: Int, x: Float, y: Float): String = String.format(Locale.US, "%d,%.4f,%.4f", id, x, y)
 +
 +    private companion object {
-+        /** A touch that stays still longer than this is a press, not a tap. */
-+        const val HOLD_MS = 200L
++        /**
++         * A touch released before this is a click. One that is still down is a press: it starts
++         * on the other phone, which turns it into a long press about half a second later.
++         */
++        const val HOLD_MS = 500L
 +
 +        /** A swipe that lasts longer than this is followed live instead of being sent at the end. */
-+        const val SWIPE_LIVE_MS = 250L
++        const val SWIPE_LIVE_MS = 500L
 +
 +        const val MOVE_INTERVAL_MS = 25L
 +        const val MIN_SWIPE_MS = 40L
-+        const val MAX_SWIPE_MS = 400L
++        const val MAX_SWIPE_MS = 500L
 +        const val MAX_SWIPE_POINTS = 60
 +    }
 +}
