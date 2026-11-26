@@ -2841,7 +2841,7 @@ index 00000000..a2284580
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
 new file mode 100644
-index 00000000..e739d578
+index 00000000..0f007c46
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
 @@ -0,0 +1,219 @@
@@ -3055,8 +3055,8 @@ index 00000000..e739d578
 +         */
 +        const val HOLD_MS = 500L
 +
-+        /** A moving finger stays a swipe (never a press) until this long; only then is it followed live. */
-+        const val SWIPE_LIVE_MS = 1500L
++        /** A moving finger is followed live after this long (a swipe of any length, like a graphic tablet); a quicker flick is sent whole. */
++        const val SWIPE_LIVE_MS = 150L
 +
 +        const val MOVE_INTERVAL_MS = 25L
 +        const val MIN_SWIPE_MS = 40L
