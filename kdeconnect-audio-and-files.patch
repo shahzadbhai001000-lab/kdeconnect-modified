@@ -1174,10 +1174,10 @@ index 00000000..f5e25daf
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureConsentActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureConsentActivity.kt
 new file mode 100644
-index 00000000..a77f4388
+index 00000000..fd017f2e
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureConsentActivity.kt
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,104 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1185,8 +1185,11 @@ index 00000000..a77f4388
 + */
 +package org.kde.kdeconnect.plugins.screenshare
 +
++import android.Manifest
 +import android.content.Intent
++import android.content.pm.PackageManager
 +import android.media.projection.MediaProjectionManager
++import android.os.Build
 +import android.os.Bundle
 +import android.widget.Toast
 +import androidx.activity.ComponentActivity
@@ -1205,6 +1208,14 @@ index 00000000..a77f4388
 +    private lateinit var deviceId: String
 +    private var preset: String = ScreenPreset.DEFAULT.name
 +    private var autoStopMinutes: Int = 0
++    private var sound: Boolean = false
++
++    // The sound of the phone can only be captured with the microphone permission. If it is
++    // refused, the screen is still shared, just without sound.
++    private val audioPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
++        sound = granted
++        launchProjectionDialog()
++    }
 +
 +    private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
 +        val data = result.data
@@ -1226,10 +1237,19 @@ index 00000000..a77f4388
 +        deviceId = id
 +        preset = intent.getStringExtra(EXTRA_PRESET) ?: ScreenPreset.DEFAULT.name
 +        autoStopMinutes = intent.getIntExtra(EXTRA_AUTO_STOP_MINUTES, 0)
++        sound = intent.getBooleanExtra(EXTRA_SOUND, true) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 +
 +        // After a configuration change the launcher delivers its pending result on its own
 +        if (savedInstanceState != null) return
 +
++        if (sound && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
++            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
++        } else {
++            launchProjectionDialog()
++        }
++    }
++
++    private fun launchProjectionDialog() {
 +        val manager = getSystemService<MediaProjectionManager>()
 +        if (manager == null) {
 +            fail(R.string.screenshare_unsupported)
@@ -1245,6 +1265,7 @@ index 00000000..a77f4388
 +            .putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
 +            .putExtra(ScreenCaptureService.EXTRA_PRESET, preset)
 +            .putExtra(ScreenCaptureService.EXTRA_AUTO_STOP_MINUTES, autoStopMinutes)
++            .putExtra(ScreenCaptureService.EXTRA_SOUND, sound)
 +        ContextCompat.startForegroundService(this, serviceIntent)
 +        finish()
 +    }
@@ -1258,14 +1279,15 @@ index 00000000..a77f4388
 +        const val EXTRA_DEVICE_ID = "deviceId"
 +        const val EXTRA_PRESET = "preset"
 +        const val EXTRA_AUTO_STOP_MINUTES = "autoStopMinutes"
++        const val EXTRA_SOUND = "sound"
 +    }
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..e2de87b9
+index 00000000..a2aeaddc
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,500 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1277,9 +1299,15 @@ index 00000000..e2de87b9
 +import android.app.PendingIntent
 +import android.app.Service
 +import android.content.Intent
++import android.Manifest
++import android.content.pm.PackageManager
 +import android.content.pm.ServiceInfo
 +import android.hardware.display.DisplayManager
 +import android.hardware.display.VirtualDisplay
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioPlaybackCaptureConfiguration
++import android.media.AudioRecord
 +import android.media.MediaCodec
 +import android.media.MediaCodecInfo
 +import android.media.MediaFormat
@@ -1297,14 +1325,18 @@ index 00000000..e2de87b9
 +import android.util.Log
 +import android.view.Surface
 +import android.view.WindowManager
++import androidx.annotation.RequiresApi
 +import androidx.core.app.NotificationCompat
 +import androidx.core.app.ServiceCompat
++import androidx.core.content.ContextCompat
 +import androidx.core.content.IntentCompat
 +import androidx.core.content.getSystemService
 +import org.kde.kdeconnect.Device
 +import org.kde.kdeconnect.KdeConnect
 +import org.kde.kdeconnect.NetworkPacket
 +import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect.plugins.audiostream.AudioStreamPlugin
++import org.kde.kdeconnect.plugins.audiostream.PcmPipeInputStream
 +import org.kde.kdeconnect_tp.R
 +
 +/**
@@ -1326,6 +1358,11 @@ index 00000000..e2de87b9
 +    private var wakeLock: PowerManager.WakeLock? = null
 +    private var wifiLock: WifiManager.WifiLock? = null
 +    private var autoStop: Runnable? = null
++    private var audioRecord: AudioRecord? = null
++    private var audioPipe: PcmPipeInputStream? = null
++
++    @Volatile
++    private var audioRunning = false
 +
 +    @Volatile
 +    private var encoder: MediaCodec? = null
@@ -1355,6 +1392,7 @@ index 00000000..e2de87b9
 +        val resultData = IntentCompat.getParcelableExtra(intent, EXTRA_RESULT_DATA, Intent::class.java)
 +        val preset = ScreenPreset.fromName(intent.getStringExtra(EXTRA_PRESET))
 +        val autoStopMinutes = intent.getIntExtra(EXTRA_AUTO_STOP_MINUTES, 0)
++        val withSound = intent.getBooleanExtra(EXTRA_SOUND, false)
 +
 +        if (device == null || resultData == null || !device.isReachable) {
 +            Log.w(LOG_TAG, "Not starting: device=$device, data=$resultData")
@@ -1364,7 +1402,7 @@ index 00000000..e2de87b9
 +
 +        stopStreaming(stopService = false) // Replace any previous stream
 +        try {
-+            startStreaming(device, resultCode, resultData, preset, autoStopMinutes)
++            startStreaming(device, resultCode, resultData, preset, autoStopMinutes, withSound)
 +        } catch (e: Exception) {
 +            Log.e(LOG_TAG, "Could not start sharing the screen", e)
 +            stopStreaming()
@@ -1384,6 +1422,7 @@ index 00000000..e2de87b9
 +        resultData: Intent,
 +        preset: ScreenPreset,
 +        autoStopMinutes: Int,
++        withSound: Boolean,
 +    ) {
 +        val projectionManager = getSystemService<MediaProjectionManager>()!!
 +        val newProjection = projectionManager.getMediaProjection(resultCode, resultData)
@@ -1474,6 +1513,83 @@ index 00000000..e2de87b9
 +        })
 +
 +        Thread({ drainLoop(newEncoder, newPipe) }, "ScreenEncoderDrain").start()
++
++        if (withSound && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startAudio(device, newProjection)
++    }
++
++    /**
++     * Sends the sound this phone plays along with the screen, as raw PCM in an audio stream packet
++     * (played by the audio streaming plugin on the other phone). Needs Android 10+. A failure
++     * here never stops the screen.
++     */
++    @RequiresApi(Build.VERSION_CODES.Q)
++    private fun startAudio(device: Device, source: MediaProjection) {
++        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
++        var record: AudioRecord? = null
++        try {
++            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(source)
++                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
++                .addMatchingUsage(AudioAttributes.USAGE_GAME)
++                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
++                .build()
++            val format = AudioFormat.Builder()
++                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                .setSampleRate(AUDIO_SAMPLE_RATE)
++                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
++                .build()
++            val minBuffer = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
++            record = AudioRecord.Builder()
++                .setAudioFormat(format)
++                .setBufferSizeInBytes(maxOf(minBuffer, AUDIO_CHUNK_BYTES * 4))
++                .setAudioPlaybackCaptureConfig(captureConfig)
++                .build()
++            if (record.state != AudioRecord.STATE_INITIALIZED) throw IllegalStateException("Audio capture not initialized")
++
++            val newPipe = PcmPipeInputStream(onClosed = { stopAudio() })
++            synchronized(lock) {
++                audioRecord = record
++                audioPipe = newPipe
++                audioRunning = true
++            }
++            device.sendPacket(NetworkPacket(AudioStreamPlugin.PACKET_TYPE_AUDIOSTREAM).apply {
++                this["sampleRate"] = AUDIO_SAMPLE_RATE
++                this["channels"] = 2
++                this["encoding"] = AudioStreamPlugin.ENCODING_PCM_S16LE
++                payload = NetworkPacket.Payload(newPipe, -1L)
++            })
++            record.startRecording()
++            val activeRecord = record
++            Thread({
++                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
++                val buffer = ByteArray(AUDIO_CHUNK_BYTES)
++                while (audioRunning) {
++                    val read = activeRecord.read(buffer, 0, buffer.size)
++                    if (read < 0) break
++                    if (read > 0) newPipe.push(buffer.copyOf(read))
++                }
++            }, "ScreenAudioCapture").start()
++        } catch (e: Exception) {
++            Log.w(LOG_TAG, "Could not capture the sound, sharing the screen without it", e)
++            stopAudio()
++            runCatching { record?.release() }
++        }
++    }
++
++    private fun stopAudio() {
++        var recordToRelease: AudioRecord? = null
++        var pipeToFinish: PcmPipeInputStream? = null
++        synchronized(lock) {
++            audioRunning = false
++            recordToRelease = audioRecord
++            pipeToFinish = audioPipe
++            audioRecord = null
++            audioPipe = null
++        }
++        pipeToFinish?.finish()
++        recordToRelease?.let {
++            runCatching { it.stop() }
++            runCatching { it.release() }
++        }
 +    }
 +
 +    /** Video sizes must be multiples of 16 for hardware encoders to accept them everywhere. */
@@ -1619,6 +1735,7 @@ index 00000000..e2de87b9
 +        }
 +        ScreenShareState.ended()
 +
++        stopAudio()
 +        autoStop?.let { handler.removeCallbacks(it) }
 +        autoStop = null
 +        pipeToFinish?.finish()
@@ -1659,18 +1776,24 @@ index 00000000..e2de87b9
 +        const val EXTRA_RESULT_DATA = "resultData"
 +        const val EXTRA_PRESET = "preset"
 +        const val EXTRA_AUTO_STOP_MINUTES = "autoStopMinutes"
++        const val EXTRA_SOUND = "sound"
 +        const val ACTION_STOP = "org.kde.kdeconnect.plugins.screenshare.STOP"
 +
 +        private const val LOG_TAG = "ScreenCaptureService"
 +        private const val NOTIFICATION_ID = 0x53435231
++
++        private const val AUDIO_SAMPLE_RATE = 48000
++
++        // 20 ms of stereo 16-bit audio per chunk
++        private const val AUDIO_CHUNK_BYTES = AUDIO_SAMPLE_RATE / 50 * 4
 +    }
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..4c466a42
+index 00000000..243674f0
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,378 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1769,10 +1892,11 @@ index 00000000..4c466a42
 +    }
 +
 +    /** Called by the viewer screen. */
-+    internal fun requestStart(preset: ScreenPreset, autoStopMinutes: Int) {
++    internal fun requestStart(preset: ScreenPreset, autoStopMinutes: Int, sound: Boolean) {
 +        device.sendPacket(request(ACTION_START).apply {
 +            this["preset"] = preset.name
 +            this["autoStopMinutes"] = autoStopMinutes
++            this["sound"] = sound
 +        })
 +    }
 +
@@ -1870,7 +1994,8 @@ index 00000000..4c466a42
 +        when (np.getString("action")) {
 +            ACTION_START -> showShareRequest(
 +                ScreenPreset.fromName(np.getString("preset", ScreenPreset.DEFAULT.name)),
-+                np.getInt("autoStopMinutes", 0)
++                np.getInt("autoStopMinutes", 0),
++                np.getBoolean("sound", true)
 +            )
 +            ACTION_STOP -> ScreenShareState.stopIfSharingWith(device.deviceId)
 +            ACTION_KEYFRAME -> ScreenShareState.requestKeyframeIfSharingWith(device.deviceId)
@@ -1952,6 +2077,7 @@ index 00000000..4c466a42
 +                .putExtra(ScreenCaptureConsentActivity.EXTRA_DEVICE_ID, device.deviceId)
 +                .putExtra(ScreenCaptureConsentActivity.EXTRA_PRESET, settings.preset.name)
 +                .putExtra(ScreenCaptureConsentActivity.EXTRA_AUTO_STOP_MINUTES, settings.autoStopMinutes)
++                .putExtra(ScreenCaptureConsentActivity.EXTRA_SOUND, settings.soundEnabled)
 +        )
 +    }
 +
@@ -1959,7 +2085,7 @@ index 00000000..4c466a42
 +     * Android only lets us ask for the screen capture consent from a visible activity, so another
 +     * device can't start sharing by itself: we ask the user to confirm with a tap on a notification.
 +     */
-+    private fun showShareRequest(preset: ScreenPreset, autoStopMinutes: Int) {
++    private fun showShareRequest(preset: ScreenPreset, autoStopMinutes: Int, sound: Boolean) {
 +        if (!notificationsAllowed()) {
 +            toast(R.string.screenshare_share_open_app_hint, device.name)
 +            return
@@ -1969,6 +2095,7 @@ index 00000000..4c466a42
 +            .putExtra(ScreenCaptureConsentActivity.EXTRA_DEVICE_ID, device.deviceId)
 +            .putExtra(ScreenCaptureConsentActivity.EXTRA_PRESET, preset.name)
 +            .putExtra(ScreenCaptureConsentActivity.EXTRA_AUTO_STOP_MINUTES, autoStopMinutes)
++            .putExtra(ScreenCaptureConsentActivity.EXTRA_SOUND, sound)
 +            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 +        val pendingIntent = PendingIntent.getActivity(
 +            context,
@@ -2047,10 +2174,10 @@ index 00000000..4c466a42
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt
 new file mode 100644
-index 00000000..36c0288d
+index 00000000..5a3b81ad
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,84 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2102,6 +2229,13 @@ index 00000000..36c0288d
 +            prefs.edit().putBoolean(KEY_SHOW_STATS, value).apply()
 +        }
 +
++    /** Whether the sound of the shared phone is sent along with its screen. */
++    var soundEnabled: Boolean
++        get() = prefs.getBoolean(KEY_SOUND, true)
++        set(value) {
++            prefs.edit().putBoolean(KEY_SOUND, value).apply()
++        }
++
 +    /** Whether touches on the viewer are sent to the other phone (otherwise it is view only). */
 +    var controlEnabled: Boolean
 +        get() = prefs.getBoolean(KEY_CONTROL, true)
@@ -2122,6 +2256,7 @@ index 00000000..36c0288d
 +        private const val KEY_SHOW_STATS = "show_stats"
 +        private const val KEY_AUTO_STOP = "auto_stop_minutes"
 +        private const val KEY_CONTROL = "control_enabled"
++        private const val KEY_SOUND = "sound_enabled"
 +
 +        /** The choices offered for the session limit, in minutes (0 = unlimited). */
 +        val AUTO_STOP_CHOICES = intArrayOf(0, 15, 30, 60, 120)
@@ -2436,10 +2571,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..a2284580
+index 00000000..8e9c47ee
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,407 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2692,7 +2827,7 @@ index 00000000..a2284580
 +    }
 +
 +    private fun requestStart() {
-+        plugin()?.requestStart(settings.preset, settings.autoStopMinutes)
++        plugin()?.requestStart(settings.preset, settings.autoStopMinutes, settings.soundEnabled)
 +        statusView.text = getString(R.string.screenshare_waiting, deviceName())
 +    }
 +
@@ -2767,10 +2902,18 @@ index 00000000..a2284580
 +        val items = arrayOf(
 +            getString(R.string.screenshare_menu_preset, getString(settings.preset.labelRes)),
 +            getString(R.string.screenshare_menu_limit, limitLabel(settings.autoStopMinutes)),
++            getString(if (settings.soundEnabled) R.string.screenshare_menu_sound_on else R.string.screenshare_menu_sound_off),
 +        )
 +        AlertDialog.Builder(this)
 +            .setItems(items) { _, which ->
-+                if (which == 0) showPresetDialog() else showLimitDialog()
++                when (which) {
++                    0 -> showPresetDialog()
++                    1 -> showLimitDialog()
++                    else -> {
++                        settings.soundEnabled = !settings.soundEnabled
++                        Toast.makeText(this, R.string.screenshare_sound_applied, Toast.LENGTH_LONG).show()
++                    }
++                }
 +            }
 +            .show()
 +    }
@@ -4571,10 +4714,10 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..115f733b 100644
+index d8b73918..5226a4b9 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,89 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +671,92 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -4651,6 +4794,9 @@ index d8b73918..115f733b 100644
 +    <string name="screenshare_preset_quality">Best quality</string>
 +    <string name="screenshare_preset_bluetooth">Bluetooth (tiny picture)</string>
 +    <string name="screenshare_preset_applied">Bitrate changed now. Size and frame rate apply the next time sharing starts.</string>
++    <string name="screenshare_menu_sound_on">Sound from the other phone: on</string>
++    <string name="screenshare_menu_sound_off">Sound from the other phone: off</string>
++    <string name="screenshare_sound_applied">The sound setting applies the next time sharing starts. Sound needs Android 10 or newer on the phone that is shared.</string>
 +    <string name="screenshare_limit_title">Session limit</string>
 +    <string name="screenshare_limit_unlimited">Unlimited</string>
 +    <string name="screenshare_limit_minutes">%1$d minutes</string>
