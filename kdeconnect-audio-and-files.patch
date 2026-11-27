@@ -886,10 +886,10 @@ index 00000000..f8ad89ee
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt
 new file mode 100644
-index 00000000..f5e25daf
+index 00000000..654c7a25
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/RemoteTouchInjector.kt
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,284 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -996,6 +996,8 @@ index 00000000..f5e25daf
 +            "recents" -> AccessibilityService.GLOBAL_ACTION_RECENTS
 +            "notifications" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
 +            "power" -> AccessibilityService.GLOBAL_ACTION_POWER_DIALOG
++            // Locking the screen needs Android 9 (API 28)
++            "lock" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN else return
 +            else -> return
 +        }
 +        handler.post { KdeConnectAccessibilityService.instance?.performGlobalAction(action) }
@@ -1284,10 +1286,10 @@ index 00000000..fd017f2e
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..a2aeaddc
+index 00000000..4d783aa8
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,505 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1323,6 +1325,7 @@ index 00000000..a2aeaddc
 +import android.os.Process
 +import android.util.DisplayMetrics
 +import android.util.Log
++import android.widget.Toast
 +import android.view.Surface
 +import android.view.WindowManager
 +import androidx.annotation.RequiresApi
@@ -1524,7 +1527,10 @@ index 00000000..a2aeaddc
 +     */
 +    @RequiresApi(Build.VERSION_CODES.Q)
 +    private fun startAudio(device: Device, source: MediaProjection) {
-+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
++        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
++            handler.post { Toast.makeText(this, R.string.screenshare_sound_no_permission, Toast.LENGTH_LONG).show() }
++            return
++        }
 +        var record: AudioRecord? = null
 +        try {
 +            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(source)
@@ -1570,6 +1576,7 @@ index 00000000..a2aeaddc
 +            }, "ScreenAudioCapture").start()
 +        } catch (e: Exception) {
 +            Log.w(LOG_TAG, "Could not capture the sound, sharing the screen without it", e)
++            handler.post { Toast.makeText(this, R.string.screenshare_sound_failed, Toast.LENGTH_LONG).show() }
 +            stopAudio()
 +            runCatching { record?.release() }
 +        }
@@ -1790,10 +1797,10 @@ index 00000000..a2aeaddc
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..243674f0
+index 00000000..8c299917
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,413 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1807,6 +1814,8 @@ index 00000000..243674f0
 +import android.app.PendingIntent
 +import android.content.Intent
 +import android.content.pm.PackageManager
++import android.media.AudioManager
++import android.os.PowerManager
 +import android.os.Build
 +import android.os.Handler
 +import android.os.Looper
@@ -1959,6 +1968,14 @@ index 00000000..243674f0
 +        })
 +    }
 +
++    /** @param name "volume_up", "volume_down", "wake" or "lock" (plus the global names above) */
++    fun sendSystem(name: String) {
++        device.sendPacket(NetworkPacket(PACKET_TYPE_SCREENSHARE_CONTROL).apply {
++            this["kind"] = KIND_SYSTEM
++            this["name"] = name
++        })
++    }
++
 +    private fun request(action: String) = NetworkPacket(PACKET_TYPE_SCREENSHARE_REQUEST).apply {
 +        this["action"] = action
 +    }
@@ -2016,6 +2033,12 @@ index 00000000..243674f0
 +    private fun handleControl(np: NetworkPacket): Boolean {
 +        if (!ScreenShareState.isSharingWith(device.deviceId)) return false
 +
++        // Volume and waking the screen don't need the accessibility service
++        if (np.getString("kind") == KIND_SYSTEM) {
++            handleSystem(np.getString("name"))
++            return true
++        }
++
 +        if (!RemoteTouchInjector.isAvailable) {
 +            val now = System.currentTimeMillis()
 +            if (now - lastUnavailableNoticeAt > UNAVAILABLE_NOTICE_INTERVAL_MS) {
@@ -2055,6 +2078,24 @@ index 00000000..243674f0
 +            else -> return false
 +        }
 +        return true
++    }
++
++    @Suppress("DEPRECATION") // Waking the screen from a lock is only possible with the old wake lock flags
++    private fun handleSystem(name: String) {
++        when (name) {
++            "volume_up", "volume_down" -> context.getSystemService<AudioManager>()?.adjustStreamVolume(
++                AudioManager.STREAM_MUSIC,
++                if (name == "volume_up") AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
++                AudioManager.FLAG_SHOW_UI
++            )
++            "wake" -> context.getSystemService<PowerManager>()
++                ?.newWakeLock(
++                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
++                    "kdeconnect:screenshare-wake"
++                )
++                ?.acquire(3000L)
++            "lock" -> RemoteTouchInjector.globalAction("lock")
++        }
 +    }
 +
 +    private fun parsePoints(text: String): Map<Int, Pair<Float, Float>> {
@@ -2166,6 +2207,7 @@ index 00000000..243674f0
 +        private const val KIND_TAP = "tap"
 +        private const val KIND_SWIPE = "swipe"
 +        private const val KIND_GLOBAL = "global"
++        private const val KIND_SYSTEM = "system"
 +
 +        private const val UNAVAILABLE_NOTICE_INTERVAL_MS = 5000L
 +
@@ -2174,10 +2216,10 @@ index 00000000..243674f0
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt
 new file mode 100644
-index 00000000..5a3b81ad
+index 00000000..930b957a
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePreset.kt
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,95 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2229,6 +2271,13 @@ index 00000000..5a3b81ad
 +            prefs.edit().putBoolean(KEY_SHOW_STATS, value).apply()
 +        }
 +
++    /** How the picture fills this phone's screen: "fill" (stretch), "fit" or "zoom". */
++    var viewMode: String
++        get() = prefs.getString(KEY_VIEW_MODE, VIEW_FILL) ?: VIEW_FILL
++        set(value) {
++            prefs.edit().putString(KEY_VIEW_MODE, value).apply()
++        }
++
 +    /** Whether the sound of the shared phone is sent along with its screen. */
 +    var soundEnabled: Boolean
 +        get() = prefs.getBoolean(KEY_SOUND, true)
@@ -2257,6 +2306,10 @@ index 00000000..5a3b81ad
 +        private const val KEY_AUTO_STOP = "auto_stop_minutes"
 +        private const val KEY_CONTROL = "control_enabled"
 +        private const val KEY_SOUND = "sound_enabled"
++        private const val KEY_VIEW_MODE = "view_mode"
++        const val VIEW_FILL = "fill"
++        const val VIEW_FIT = "fit"
++        const val VIEW_ZOOM = "zoom"
 +
 +        /** The choices offered for the session limit, in minutes (0 = unlimited). */
 +        val AUTO_STOP_CHOICES = intArrayOf(0, 15, 30, 60, 120)
@@ -2571,10 +2624,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..8e9c47ee
+index 00000000..dbe5f137
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,483 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2587,6 +2640,7 @@ index 00000000..8e9c47ee
 +import android.content.Context
 +import android.graphics.Color
 +import android.graphics.Typeface
++import android.os.Build
 +import android.os.Bundle
 +import android.os.Handler
 +import android.os.Looper
@@ -2602,6 +2656,7 @@ index 00000000..8e9c47ee
 +import android.widget.FrameLayout
 +import android.widget.LinearLayout
 +import android.widget.TextView
++import android.view.KeyEvent
 +import android.widget.Toast
 +import androidx.activity.ComponentActivity
 +import androidx.core.view.WindowCompat
@@ -2661,6 +2716,12 @@ index 00000000..8e9c47ee
 +        settings = ScreenShareSettings(this)
 +
 +        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            // Use the whole screen, including the sides of a notch
++            window.attributes = window.attributes.apply {
++                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
++            }
++        }
 +        WindowCompat.setDecorFitsSystemWindows(window, false)
 +        WindowCompat.getInsetsController(window, window.decorView).apply {
 +            hide(WindowInsetsCompat.Type.systemBars())
@@ -2726,6 +2787,7 @@ index 00000000..8e9c47ee
 +            surfaceView,
 +            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER)
 +        )
++        surfaceView.setMode(settings.viewMode)
 +        setupTouch()
 +
 +        statusView = TextView(this).apply {
@@ -2775,6 +2837,9 @@ index 00000000..8e9c47ee
 +        nav.addView(barButton(R.string.screenshare_nav_back) { plugin()?.sendGlobalAction("back") })
 +        nav.addView(barButton(R.string.screenshare_nav_home) { plugin()?.sendGlobalAction("home") })
 +        nav.addView(barButton(R.string.screenshare_nav_recents) { plugin()?.sendGlobalAction("recents") })
++        nav.addView(barButton(R.string.screenshare_nav_vol_down) { plugin()?.sendSystem("volume_down") })
++        nav.addView(barButton(R.string.screenshare_nav_vol_up) { plugin()?.sendSystem("volume_up") })
++        nav.addView(barButton(R.string.screenshare_nav_power) { showPowerMenu() })
 +        root.addView(
 +            nav,
 +            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
@@ -2792,7 +2857,7 @@ index 00000000..8e9c47ee
 +        minimumHeight = 0
 +        minWidth = 0
 +        minimumWidth = 0
-+        setPadding(dp(10), dp(4), dp(10), dp(4))
++        setPadding(dp(6), dp(4), dp(6), dp(4))
 +        setOnClickListener { onClick() }
 +    }
 +
@@ -2903,12 +2968,14 @@ index 00000000..8e9c47ee
 +            getString(R.string.screenshare_menu_preset, getString(settings.preset.labelRes)),
 +            getString(R.string.screenshare_menu_limit, limitLabel(settings.autoStopMinutes)),
 +            getString(if (settings.soundEnabled) R.string.screenshare_menu_sound_on else R.string.screenshare_menu_sound_off),
++            getString(R.string.screenshare_menu_size, getString(viewModeLabel(settings.viewMode))),
 +        )
 +        AlertDialog.Builder(this)
 +            .setItems(items) { _, which ->
 +                when (which) {
 +                    0 -> showPresetDialog()
 +                    1 -> showLimitDialog()
++                    3 -> showSizeDialog()
 +                    else -> {
 +                        settings.soundEnabled = !settings.soundEnabled
 +                        Toast.makeText(this, R.string.screenshare_sound_applied, Toast.LENGTH_LONG).show()
@@ -2947,6 +3014,53 @@ index 00000000..8e9c47ee
 +            .show()
 +    }
 +
++    private fun viewModeLabel(mode: String): Int = when (mode) {
++        ScreenShareSettings.VIEW_FIT -> R.string.screenshare_size_fit
++        ScreenShareSettings.VIEW_ZOOM -> R.string.screenshare_size_zoom
++        else -> R.string.screenshare_size_fill
++    }
++
++    private fun showSizeDialog() {
++        val modes = listOf(ScreenShareSettings.VIEW_FILL, ScreenShareSettings.VIEW_FIT, ScreenShareSettings.VIEW_ZOOM)
++        val labels = modes.map { getString(viewModeLabel(it)) }.toTypedArray()
++        AlertDialog.Builder(this)
++            .setTitle(R.string.screenshare_size_title)
++            .setSingleChoiceItems(labels, modes.indexOf(settings.viewMode).coerceAtLeast(0)) { dialog, which ->
++                settings.viewMode = modes[which]
++                surfaceView.setMode(modes[which])
++                dialog.dismiss()
++            }
++            .show()
++    }
++
++    private fun showPowerMenu() {
++        val labels = arrayOf(
++            getString(R.string.screenshare_power_menu),
++            getString(R.string.screenshare_power_lock),
++            getString(R.string.screenshare_power_wake),
++        )
++        AlertDialog.Builder(this)
++            .setItems(labels) { _, which ->
++                when (which) {
++                    0 -> plugin()?.sendGlobalAction("power")
++                    1 -> plugin()?.sendSystem("lock")
++                    else -> plugin()?.sendSystem("wake")
++                }
++            }
++            .show()
++    }
++
++    /** The volume keys of this phone change the volume of the other phone. */
++    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
++        if (decoder != null && settings.controlEnabled) {
++            when (keyCode) {
++                KeyEvent.KEYCODE_VOLUME_UP -> { plugin()?.sendSystem("volume_up"); return true }
++                KeyEvent.KEYCODE_VOLUME_DOWN -> { plugin()?.sendSystem("volume_down"); return true }
++            }
++        }
++        return super.onKeyDown(keyCode, event)
++    }
++
 +    private fun limitLabel(minutes: Int): String =
 +        if (minutes == 0) getString(R.string.screenshare_limit_unlimited) else getString(R.string.screenshare_limit_minutes, minutes)
 +
@@ -2956,6 +3070,12 @@ index 00000000..8e9c47ee
 +    private class AspectSurfaceView(context: Context) : SurfaceView(context) {
 +        private var videoWidth = 0
 +        private var videoHeight = 0
++        private var mode = ScreenShareSettings.VIEW_FILL
++
++        fun setMode(newMode: String) {
++            mode = newMode
++            requestLayout()
++        }
 +
 +        fun setVideoSize(width: Int, height: Int) {
 +            videoWidth = width
@@ -2970,7 +3090,16 @@ index 00000000..8e9c47ee
 +                setMeasuredDimension(maxWidth, maxHeight)
 +                return
 +            }
-+            val scale = minOf(maxWidth.toFloat() / videoWidth, maxHeight.toFloat() / videoHeight)
++            if (mode == ScreenShareSettings.VIEW_FILL) {
++                // Stretch to the whole screen: touches still land in the right place, because they are
++                // sent as a fraction of the picture
++                setMeasuredDimension(maxWidth, maxHeight)
++                return
++            }
++            val widthScale = maxWidth.toFloat() / videoWidth
++            val heightScale = maxHeight.toFloat() / videoHeight
++            // Fit keeps everything visible; zoom fills the screen and crops what doesn't fit
++            val scale = if (mode == ScreenShareSettings.VIEW_ZOOM) maxOf(widthScale, heightScale) else minOf(widthScale, heightScale)
 +            setMeasuredDimension((videoWidth * scale).toInt(), (videoHeight * scale).toInt())
 +        }
 +    }
@@ -4714,10 +4843,10 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..5226a4b9 100644
+index d8b73918..258af4eb 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,92 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +671,105 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -4797,6 +4926,19 @@ index d8b73918..5226a4b9 100644
 +    <string name="screenshare_menu_sound_on">Sound from the other phone: on</string>
 +    <string name="screenshare_menu_sound_off">Sound from the other phone: off</string>
 +    <string name="screenshare_sound_applied">The sound setting applies the next time sharing starts. Sound needs Android 10 or newer on the phone that is shared.</string>
++    <string name="screenshare_menu_size">Screen size: %1$s</string>
++    <string name="screenshare_size_title">Screen size</string>
++    <string name="screenshare_size_fill">Fill the screen (stretch)</string>
++    <string name="screenshare_size_fit">Fit (keep proportions)</string>
++    <string name="screenshare_size_zoom">Zoom (fill, crop the edges)</string>
++    <string name="screenshare_nav_vol_down">Vol −</string>
++    <string name="screenshare_nav_vol_up">Vol +</string>
++    <string name="screenshare_nav_power">Power</string>
++    <string name="screenshare_power_menu">Power menu</string>
++    <string name="screenshare_power_lock">Lock the screen (Android 9+)</string>
++    <string name="screenshare_power_wake">Wake the screen</string>
++    <string name="screenshare_sound_no_permission">Sound is off: the microphone permission was not allowed, which Android needs to capture sound.</string>
++    <string name="screenshare_sound_failed">This phone could not capture its sound, so only the screen is shared.</string>
 +    <string name="screenshare_limit_title">Session limit</string>
 +    <string name="screenshare_limit_unlimited">Unlimited</string>
 +    <string name="screenshare_limit_minutes">%1$d minutes</string>
