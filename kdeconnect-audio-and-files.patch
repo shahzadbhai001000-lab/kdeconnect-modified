@@ -1286,10 +1286,10 @@ index 00000000..fd017f2e
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..118f82b7
+index 00000000..ce79f57a
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,591 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1374,6 +1374,12 @@ index 00000000..118f82b7
 +    @Volatile
 +    private var running = false
 +
++    // What the current stream was started with, to rebuild it when the phone is rotated
++    private var streamDevice: Device? = null
++    private var streamPreset = ScreenPreset.BALANCED
++    private var streamWidth = 0
++    private var streamHeight = 0
++
 +    override fun onBind(intent: Intent?): IBinder? = null
 +
 +    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -1419,6 +1425,90 @@ index 00000000..118f82b7
 +        super.onDestroy()
 +    }
 +
++    /** The phone was rotated: the picture needs the new shape, so the video is rebuilt at that size. */
++    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
++        super.onConfigurationChanged(newConfig)
++        // Give the screen a moment to finish turning before reading its size
++        handler.postDelayed({ restartForNewSize() }, 400L)
++    }
++
++    @Suppress("DEPRECATION")
++    private fun restartForNewSize() {
++        val device = streamDevice ?: return
++        val preset = streamPreset
++        val liveDisplay = synchronized(lock) { if (running) display else null } ?: return
++
++        val metrics = DisplayMetrics()
++        getSystemService<WindowManager>()!!.defaultDisplay.getRealMetrics(metrics)
++        val (width, height) = scaledSize(metrics.widthPixels, metrics.heightPixels, preset.maxSide)
++        if (width == streamWidth && height == streamHeight) return
++
++        val created = try {
++            createEncoder(width, height, preset)
++        } catch (e: Exception) {
++            Log.w(LOG_TAG, "Could not resize the stream", e)
++            return
++        }
++        val (newEncoder, newSurface) = created
++
++        var self: VideoPipeInputStream? = null
++        val newPipe = VideoPipeInputStream(
++            // Only the stream in use ends the sharing: the old one is closed on purpose
++            onClosed = { if (synchronized(lock) { pipe === self }) stopStreaming() },
++            onFirstRead = { requestKeyframe() },
++        )
++        self = newPipe
++
++        var oldEncoder: MediaCodec? = null
++        var oldSurface: Surface? = null
++        var oldPipe: VideoPipeInputStream? = null
++        synchronized(lock) {
++            oldEncoder = encoder
++            oldSurface = inputSurface
++            oldPipe = pipe
++            encoder = newEncoder
++            inputSurface = newSurface
++            pipe = newPipe
++        }
++        streamWidth = width
++        streamHeight = height
++
++        runCatching {
++            liveDisplay.resize(width, height, metrics.densityDpi)
++            liveDisplay.surface = newSurface
++        }.onFailure { Log.w(LOG_TAG, "Could not resize the virtual display", it) }
++
++        oldPipe?.finish()
++        oldEncoder?.let {
++            runCatching { it.stop() }
++            runCatching { it.release() }
++        }
++        oldSurface?.let { runCatching { it.release() } }
++
++        sendStream(device, width, height, preset, newPipe)
++        Thread({ drainLoop(newEncoder, newPipe) }, "ScreenEncoderDrain").start()
++    }
++
++    private fun sendStream(device: Device, width: Int, height: Int, preset: ScreenPreset, source: VideoPipeInputStream) {
++        val packet = NetworkPacket(ScreenSharePlugin.PACKET_TYPE_SCREENSHARE).apply {
++            this["width"] = width
++            this["height"] = height
++            this["fps"] = preset.fps
++            this["bitrate"] = preset.bitrate
++            this["codec"] = ScreenSharePlugin.CODEC_H264
++            // The size of a live stream is unknown, and the payload ends when the stream closes
++            payload = NetworkPacket.Payload(source, -1L)
++        }
++        device.sendPacket(packet, object : Device.SendPacketStatusCallback() {
++            override fun onSuccess() {}
++
++            override fun onFailure(e: Throwable) {
++                Log.e(LOG_TAG, "Could not send the screen to ${device.name}", e)
++                stopStreaming()
++            }
++        })
++    }
++
 +    @Suppress("DEPRECATION") // Display.getRealMetrics is the only way to get the full size on API < 30
 +    private fun startStreaming(
 +        device: Device,
@@ -1450,10 +1540,13 @@ index 00000000..118f82b7
 +            throw e
 +        }
 +
++        var firstPipe: VideoPipeInputStream? = null
 +        val newPipe = VideoPipeInputStream(
-+            onClosed = { stopStreaming() },
++            // The stream is replaced when the phone rotates; only the one in use ends the sharing
++            onClosed = { if (synchronized(lock) { pipe === firstPipe }) stopStreaming() },
 +            onFirstRead = { requestKeyframe() },
 +        )
++        firstPipe = newPipe
 +
 +        val newDisplay = try {
 +            newProjection.createVirtualDisplay(
@@ -1482,6 +1575,10 @@ index 00000000..118f82b7
 +            pipe = newPipe
 +            running = true
 +        }
++        streamDevice = device
++        streamPreset = preset
++        streamWidth = width
++        streamHeight = height
 +        acquireLocks()
 +        if (autoStopMinutes > 0) {
 +            val stopper = Runnable { stopStreaming() }
@@ -1498,23 +1595,7 @@ index 00000000..118f82b7
 +            )
 +        )
 +
-+        val packet = NetworkPacket(ScreenSharePlugin.PACKET_TYPE_SCREENSHARE).apply {
-+            this["width"] = width
-+            this["height"] = height
-+            this["fps"] = preset.fps
-+            this["bitrate"] = preset.bitrate
-+            this["codec"] = ScreenSharePlugin.CODEC_H264
-+            // The size of a live stream is unknown, and the payload ends when the stream closes
-+            payload = NetworkPacket.Payload(newPipe, -1L)
-+        }
-+        device.sendPacket(packet, object : Device.SendPacketStatusCallback() {
-+            override fun onSuccess() {}
-+
-+            override fun onFailure(e: Throwable) {
-+                Log.e(LOG_TAG, "Could not send the screen to ${device.name}", e)
-+                stopStreaming()
-+            }
-+        })
++        sendStream(device, width, height, preset, newPipe)
 +
 +        Thread({ drainLoop(newEncoder, newPipe) }, "ScreenEncoderDrain").start()
 +
@@ -1686,7 +1767,8 @@ index 00000000..118f82b7
 +            }
 +            runCatching { codec.releaseOutputBuffer(index, false) }
 +        }
-+        if (running) stopStreaming() // Ended by itself, not because we were asked to stop
++        // Ended by itself (not asked to stop, and not replaced by a new encoder after a rotation)
++        if (running && encoder === codec) stopStreaming()
 +    }
 +
 +    private fun requestKeyframe() {
@@ -2681,10 +2763,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..b9a26e56
+index 00000000..a0ff2d3a
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,578 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2695,6 +2777,7 @@ index 00000000..b9a26e56
 +import android.annotation.SuppressLint
 +import android.app.AlertDialog
 +import android.content.Context
++import android.content.pm.ActivityInfo
 +import android.graphics.Color
 +import android.graphics.Typeface
 +import android.os.Build
@@ -2926,6 +3009,12 @@ index 00000000..b9a26e56
 +        decoder?.stop()
 +        streamHeader = header
 +        surfaceView.setVideoSize(header.width, header.height)
++        // Turn this phone the same way as the shared one, so the picture fills the screen
++        requestedOrientation = if (header.width > header.height) {
++            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
++        } else {
++            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
++        }
 +        statusView.visibility = View.GONE
 +
 +        lastBytes = 0L
