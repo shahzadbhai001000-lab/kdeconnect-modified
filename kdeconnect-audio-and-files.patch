@@ -1801,10 +1801,10 @@ index 00000000..118f82b7
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..f0416165
+index 00000000..29ed8801
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,443 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1834,6 +1834,7 @@ index 00000000..f0416165
 +import org.kde.kdeconnect.plugins.Plugin
 +import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 +import org.kde.kdeconnect.plugins.screenshare.adb.AdbInputSession
++import org.kde.kdeconnect.plugins.screenshare.adb.UsbAdbSetup
 +import org.kde.kdeconnect_tp.R
 +
 +/**
@@ -2192,6 +2193,14 @@ index 00000000..f0416165
 +        PluginUiButton(context.getString(R.string.screenshare_adb_setup), R.drawable.ic_phonelink_36dp) {
 +            // Set up exact touch on THIS phone, so the other phone can control it with all fingers
 +            AdbInputSession.start(context) { status ->
++                Handler(Looper.getMainLooper()).post {
++                    Toast.makeText(context, context.getString(R.string.screenshare_adb_status, status), Toast.LENGTH_LONG).show()
++                }
++            }
++        },
++        PluginUiButton(context.getString(R.string.screenshare_adb_otg), R.drawable.ic_phonelink_36dp) {
++            // Run on THIS phone with the OTG cable: switches ADB over Wi-Fi on for the phone at the other end
++            UsbAdbSetup.enableTcpip(context) { status ->
 +                Handler(Looper.getMainLooper()).post {
 +                    Toast.makeText(context, context.getString(R.string.screenshare_adb_status, status), Toast.LENGTH_LONG).show()
 +                }
@@ -4180,6 +4189,158 @@ index 00000000..50f5eb2b
 +
 +    private const val INJECT_ASYNC = 0
 +}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/UsbAdbSetup.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/UsbAdbSetup.kt
+new file mode 100644
+index 00000000..8a61aba3
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/UsbAdbSetup.kt
+@@ -0,0 +1,146 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.screenshare.adb
++
++import android.app.PendingIntent
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.hardware.usb.UsbConstants
++import android.hardware.usb.UsbDevice
++import android.hardware.usb.UsbDeviceConnection
++import android.hardware.usb.UsbEndpoint
++import android.hardware.usb.UsbInterface
++import android.hardware.usb.UsbManager
++import android.os.Build
++import androidx.core.content.ContextCompat
++import androidx.core.content.getSystemService
++import java.io.IOException
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++/** ADB over a USB cable: this phone plays the role of the computer. */
++internal class UsbAdbTransport(
++    private val connection: UsbDeviceConnection,
++    private val usbInterface: UsbInterface,
++    private val input: UsbEndpoint,
++    private val output: UsbEndpoint,
++) : AdbTransport {
++
++    init {
++        if (!connection.claimInterface(usbInterface, true)) throw IOException("Could not use the USB connection")
++    }
++
++    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++        val count = connection.bulkTransfer(input, buffer, offset, length, READ_TIMEOUT_MS)
++        if (count < 0) throw IOException("No answer over USB")
++        return count
++    }
++
++    override fun write(buffer: ByteArray, offset: Int, length: Int) {
++        if (length == 0) return
++        val count = connection.bulkTransfer(output, buffer, offset, length, WRITE_TIMEOUT_MS)
++        if (count != length) throw IOException("USB write failed")
++    }
++
++    override fun close() {
++        runCatching { connection.releaseInterface(usbInterface) }
++        runCatching { connection.close() }
++    }
++
++    private companion object {
++        const val READ_TIMEOUT_MS = 30_000 // time for the user to tap "Allow" on the other phone
++        const val WRITE_TIMEOUT_MS = 5_000
++    }
++}
++
++/**
++ * Switches ADB over Wi-Fi on for the phone at the other end of an OTG cable (it is the same as
++ * `adb tcpip 5555` on a computer), so the phone can later be controlled with exact touch. It needs
++ * USB debugging switched on in that phone's Developer options. Android turns this off again when
++ * that phone restarts.
++ */
++internal object UsbAdbSetup {
++
++    private const val ACTION_USB_PERMISSION = "org.kde.kdeconnect.plugins.screenshare.USB_PERMISSION"
++
++    fun enableTcpip(context: Context, onStatus: (String) -> Unit) {
++        val app = context.applicationContext
++        Thread({
++            var connection: AdbConnection? = null
++            try {
++                val manager = app.getSystemService<UsbManager>() ?: throw IOException("This phone has no USB host support")
++                val found = manager.deviceList.values.firstNotNullOfOrNull { device -> findAdbInterface(device)?.let { device to it } }
++                    ?: throw IOException("no phone found on the cable. Use the OTG adapter on this phone, and turn on USB debugging on the other one")
++                val (device, iface) = found
++
++                if (!manager.hasPermission(device)) {
++                    onStatus("allow USB access for the other phone")
++                    if (!askPermission(app, manager, device)) throw IOException("USB access was not allowed")
++                }
++
++                val usb = manager.openDevice(device) ?: throw IOException("could not open the USB connection")
++                var inEndpoint: UsbEndpoint? = null
++                var outEndpoint: UsbEndpoint? = null
++                for (i in 0 until iface.endpointCount) {
++                    val endpoint = iface.getEndpoint(i)
++                    if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
++                    if (endpoint.direction == UsbConstants.USB_DIR_IN) inEndpoint = endpoint else outEndpoint = endpoint
++                }
++                if (inEndpoint == null || outEndpoint == null) {
++                    usb.close()
++                    throw IOException("the USB debugging connection was not found")
++                }
++
++                val adb = AdbConnection(UsbAdbTransport(usb, iface, inEndpoint, outEndpoint), AdbKey.load(app))
++                connection = adb
++                adb.onWaitingForUser = { onStatus("on the other phone, tap \"Allow\" (tick \"Always allow\")") }
++                adb.connect()
++
++                onStatus("switching on ADB over Wi-Fi…")
++                val done = CountDownLatch(1)
++                adb.openService("tcpip:${AdbInputSession.ADB_PORT}", onOutput = { done.countDown() }, onEnd = { done.countDown() })
++                done.await(6, TimeUnit.SECONDS)
++                onStatus("done. Now start sharing from the other phone, or press \"Set up exact touch\" on it")
++            } catch (e: Exception) {
++                onStatus("failed: ${e.message ?: e.javaClass.simpleName}")
++            } finally {
++                connection?.close()
++            }
++        }, "UsbAdbSetup").start()
++    }
++
++    private fun findAdbInterface(device: UsbDevice): UsbInterface? {
++        for (i in 0 until device.interfaceCount) {
++            val iface = device.getInterface(i)
++            if (iface.interfaceClass == 0xFF && iface.interfaceSubclass == 0x42 && iface.interfaceProtocol == 1) return iface
++        }
++        return null
++    }
++
++    private fun askPermission(context: Context, manager: UsbManager, device: UsbDevice): Boolean {
++        val latch = CountDownLatch(1)
++        var granted = false
++        val receiver = object : BroadcastReceiver() {
++            override fun onReceive(context: Context, intent: Intent) {
++                granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
++                latch.countDown()
++            }
++        }
++        ContextCompat.registerReceiver(context, receiver, IntentFilter(ACTION_USB_PERMISSION), ContextCompat.RECEIVER_NOT_EXPORTED)
++        try {
++            val flags = PendingIntent.FLAG_UPDATE_CURRENT or
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
++            val intent = Intent(ACTION_USB_PERMISSION).setPackage(context.packageName)
++            manager.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, flags))
++            latch.await(30, TimeUnit.SECONDS)
++        } finally {
++            runCatching { context.unregisterReceiver(receiver) }
++        }
++        return granted
++    }
++}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt
 new file mode 100644
 index 00000000..f2646b61
@@ -5547,10 +5708,10 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..4a754f4f 100644
+index d8b73918..49147b33 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,107 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +671,108 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -5644,6 +5805,7 @@ index d8b73918..4a754f4f 100644
 +    <string name="screenshare_sound_no_permission">Sound is off: the microphone permission was not allowed, which Android needs to capture sound.</string>
 +    <string name="screenshare_sound_failed">This phone could not capture its sound, so only the screen is shared.</string>
 +    <string name="screenshare_adb_setup">Set up exact touch (ADB) on this phone</string>
++    <string name="screenshare_adb_otg">Switch on exact touch on the phone at the end of the OTG cable</string>
 +    <string name="screenshare_adb_status">Exact touch: %1$s</string>
 +    <string name="screenshare_limit_title">Session limit</string>
 +    <string name="screenshare_limit_unlimited">Unlimited</string>
