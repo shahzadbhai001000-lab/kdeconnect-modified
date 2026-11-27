@@ -1286,10 +1286,10 @@ index 00000000..fd017f2e
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..4d783aa8
+index 00000000..118f82b7
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,509 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1340,6 +1340,7 @@ index 00000000..4d783aa8
 +import org.kde.kdeconnect.helpers.NotificationHelper
 +import org.kde.kdeconnect.plugins.audiostream.AudioStreamPlugin
 +import org.kde.kdeconnect.plugins.audiostream.PcmPipeInputStream
++import org.kde.kdeconnect.plugins.screenshare.adb.AdbInputSession
 +import org.kde.kdeconnect_tp.R
 +
 +/**
@@ -1518,6 +1519,9 @@ index 00000000..4d783aa8
 +        Thread({ drainLoop(newEncoder, newPipe) }, "ScreenEncoderDrain").start()
 +
 +        if (withSound && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startAudio(device, newProjection)
++
++        // If exact touch (ADB) was set up on this phone, start it quietly so the other phone can use it
++        AdbInputSession.start(applicationContext)
 +    }
 +
 +    /**
@@ -1797,10 +1801,10 @@ index 00000000..4d783aa8
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..8c299917
+index 00000000..f0416165
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,434 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1829,6 +1833,7 @@ index 00000000..8c299917
 +import org.kde.kdeconnect.helpers.NotificationHelper
 +import org.kde.kdeconnect.plugins.Plugin
 +import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
++import org.kde.kdeconnect.plugins.screenshare.adb.AdbInputSession
 +import org.kde.kdeconnect_tp.R
 +
 +/**
@@ -2017,8 +2022,14 @@ index 00000000..8c299917
 +            ACTION_STOP -> ScreenShareState.stopIfSharingWith(device.deviceId)
 +            ACTION_KEYFRAME -> ScreenShareState.requestKeyframeIfSharingWith(device.deviceId)
 +            ACTION_BITRATE -> ScreenShareState.setBitrateIfSharingWith(device.deviceId, np.getInt("bitrate", 0))
-+            ACTION_PING -> device.sendPacket(request(ACTION_PONG).apply { this["ts"] = np.getLong("ts", 0L) })
-+            ACTION_PONG -> ScreenShareState.lastRttMs = maxOf(0L, System.currentTimeMillis() - np.getLong("ts", 0L))
++            ACTION_PING -> device.sendPacket(request(ACTION_PONG).apply {
++                this["ts"] = np.getLong("ts", 0L)
++                this["exact"] = AdbInputSession.ready
++            })
++            ACTION_PONG -> {
++                ScreenShareState.lastRttMs = maxOf(0L, System.currentTimeMillis() - np.getLong("ts", 0L))
++                ScreenShareState.hostExactTouch = np.getBoolean("exact", false)
++            }
 +            ACTION_GESTURE_RESULT -> ScreenShareState.lastGestureResult = np.getString("text", "-")
 +            ACTION_CONTROL_UNAVAILABLE -> toast(R.string.screenshare_control_unavailable, device.name)
 +            else -> return false
@@ -2032,6 +2043,12 @@ index 00000000..8c299917
 +     */
 +    private fun handleControl(np: NetworkPacket): Boolean {
 +        if (!ScreenShareState.isSharingWith(device.deviceId)) return false
++
++        // With ADB set up, every finger is copied live and the accessibility service is not needed
++        if (np.getString("kind") == KIND_TOUCH && AdbInputSession.ready) {
++            AdbInputSession.touch(np.getString("action"), np.getInt("id", -1), parsePoints(np.getString("points", "")))
++            return true
++        }
 +
 +        // Volume and waking the screen don't need the accessibility service
 +        if (np.getString("kind") == KIND_SYSTEM) {
@@ -2171,6 +2188,14 @@ index 00000000..8c299917
 +        },
 +        PluginUiButton(context.getString(R.string.screenshare_share_here), R.drawable.ic_phonelink_36dp) { activity ->
 +            startSharing(activity)
++        },
++        PluginUiButton(context.getString(R.string.screenshare_adb_setup), R.drawable.ic_phonelink_36dp) {
++            // Set up exact touch on THIS phone, so the other phone can control it with all fingers
++            AdbInputSession.start(context) { status ->
++                Handler(Looper.getMainLooper()).post {
++                    Toast.makeText(context, context.getString(R.string.screenshare_adb_status, status), Toast.LENGTH_LONG).show()
++                }
++            }
 +        },
 +    )
 +
@@ -2317,10 +2342,10 @@ index 00000000..930b957a
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
 new file mode 100644
-index 00000000..7d6a9876
+index 00000000..f24f7c21
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,87 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2395,6 +2420,10 @@ index 00000000..7d6a9876
 +
 +    @Synchronized
 +    fun takePending(): Pair<StreamHeader, NetworkPacket.Payload>? = pending.also { pending = null }
++
++    /** True when the other phone can copy every finger live through ADB (so touches are sent raw). */
++    @Volatile
++    var hostExactTouch: Boolean = false
 +
 +    /** How the last tap or swipe went on the other phone, for the speed readout. */
 +    @Volatile
@@ -3113,10 +3142,10 @@ index 00000000..dbe5f137
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
 new file mode 100644
-index 00000000..0f007c46
+index 00000000..23250a22
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/TouchGestureSender.kt
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,256 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -3184,6 +3213,11 @@ index 00000000..0f007c46
 +        height = view.height.toFloat()
 +        updateCurrent(event)
 +
++        if (ScreenShareState.hostExactTouch) {
++            onRaw(event)
++            return
++        }
++
 +        when (event.actionMasked) {
 +            MotionEvent.ACTION_DOWN -> onDown(event)
 +            MotionEvent.ACTION_POINTER_DOWN -> onPointerDown(event)
@@ -3191,6 +3225,37 @@ index 00000000..0f007c46
 +            MotionEvent.ACTION_POINTER_UP -> onPointerUp(event)
 +            MotionEvent.ACTION_UP -> onUp(event)
 +            MotionEvent.ACTION_CANCEL -> onCancel()
++        }
++    }
++
++    /**
++     * The other phone follows fingers live through ADB, so there is nothing to guess: every finger
++     * is sent exactly as it moves.
++     */
++    private fun onRaw(event: MotionEvent) {
++        val id = event.getPointerId(event.actionIndex)
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
++                lastSent = "exact down"
++                plugin()?.sendTouch("down", id, pointsText(), null, null)
++            }
++            MotionEvent.ACTION_MOVE -> if (event.eventTime - lastMoveSentAt >= RAW_MOVE_INTERVAL_MS) {
++                lastMoveSentAt = event.eventTime
++                plugin()?.sendTouch("move", -1, pointsText(), null, null)
++            }
++            MotionEvent.ACTION_POINTER_UP -> {
++                plugin()?.sendTouch("up", id, pointsText(), null, null)
++                current.remove(id)
++            }
++            MotionEvent.ACTION_UP -> {
++                lastSent = "exact"
++                plugin()?.sendTouch("up", id, pointsText(), null, null)
++                current.clear()
++            }
++            MotionEvent.ACTION_CANCEL -> {
++                plugin()?.sendTouch("cancel", -1, pointsText(), null, null)
++                current.clear()
++            }
 +        }
 +    }
 +
@@ -3331,6 +3396,7 @@ index 00000000..0f007c46
 +        const val SWIPE_LIVE_MS = 150L
 +
 +        const val MOVE_INTERVAL_MS = 25L
++        const val RAW_MOVE_INTERVAL_MS = 8L
 +        const val MIN_SWIPE_MS = 40L
 +        const val MAX_SWIPE_MS = 1500L
 +        const val MAX_SWIPE_POINTS = 60
@@ -3475,6 +3541,644 @@ index 00000000..cb30c081
 +        private val EMPTY = ByteArray(0)
 +        private val END_OF_STREAM = ByteArray(0)
 +    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbConnection.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbConnection.kt
+new file mode 100644
+index 00000000..e0183160
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbConnection.kt
+@@ -0,0 +1,194 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.screenshare.adb
++
++import java.io.IOException
++import java.io.InputStream
++import java.io.OutputStream
++import java.net.InetSocketAddress
++import java.net.Socket
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/** A way to reach adbd: a TCP socket, or a USB cable (see [UsbAdbTransport]). */
++internal interface AdbTransport {
++    /** Reads at least one byte (up to [length]); returns -1 at the end. */
++    fun read(buffer: ByteArray, offset: Int, length: Int): Int
++    fun write(buffer: ByteArray, offset: Int, length: Int)
++    fun close()
++}
++
++internal class TcpAdbTransport(host: String, port: Int) : AdbTransport {
++    private val socket = Socket().apply {
++        tcpNoDelay = true
++        connect(InetSocketAddress(host, port), 3000)
++        soTimeout = HANDSHAKE_TIMEOUT_MS
++    }
++    private val input: InputStream = socket.getInputStream()
++    private val output: OutputStream = socket.getOutputStream()
++
++    override fun read(buffer: ByteArray, offset: Int, length: Int): Int = input.read(buffer, offset, length)
++
++    override fun write(buffer: ByteArray, offset: Int, length: Int) {
++        output.write(buffer, offset, length)
++        output.flush()
++    }
++
++    override fun close() {
++        runCatching { socket.close() }
++    }
++
++    fun clearTimeout() {
++        socket.soTimeout = 0
++    }
++
++    companion object {
++        const val HANDSHAKE_TIMEOUT_MS = 30_000 // time for the user to tap "Allow"
++    }
++}
++
++/**
++ * A minimal ADB client: connects to adbd (the "ADB server" built into every phone), signs in with our
++ * key, and opens services such as `shell:...` or `tcpip:5555`.
++ */
++internal class AdbConnection(private val transport: AdbTransport, private val key: AdbKey) {
++
++    private class Message(val command: Int, val arg0: Int, val arg1: Int, val data: ByteArray)
++
++    private val writeLock = Any()
++
++    @Volatile
++    private var maxData = 4096
++
++    /** Called when the phone is showing the "Allow USB debugging?" question. */
++    var onWaitingForUser: (() -> Unit)? = null
++
++    @Throws(IOException::class)
++    fun connect() {
++        send(A_CNXN, VERSION, MAX_PAYLOAD, "host::\u0000".toByteArray())
++        var signed = false
++        var keySent = false
++        repeat(8) {
++            val message = readMessage()
++            when (message.command) {
++                A_CNXN -> {
++                    maxData = minOf(message.arg1, MAX_PAYLOAD).coerceAtLeast(1024)
++                    (transport as? TcpAdbTransport)?.clearTimeout()
++                    return
++                }
++                A_AUTH -> if (message.arg0 == AUTH_TOKEN) {
++                    if (!signed) {
++                        signed = true
++                        send(A_AUTH, AUTH_SIGNATURE, 0, key.sign(message.data))
++                    } else if (!keySent) {
++                        keySent = true
++                        onWaitingForUser?.invoke()
++                        send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyForAdb())
++                    } else {
++                        throw IOException("The phone refused this app's key")
++                    }
++                }
++            }
++        }
++        throw IOException("The phone did not accept the connection")
++    }
++
++    /**
++     * Opens a service like `shell:ls` and passes everything it prints to [onOutput] on its own thread.
++     * The service ends when it finishes or when [close] is called.
++     */
++    @Throws(IOException::class)
++    fun openService(service: String, onOutput: (ByteArray) -> Unit, onEnd: () -> Unit = {}): Thread {
++        val localId = 1
++        send(A_OPEN, localId, 0, (service + "\u0000").toByteArray())
++        val thread = Thread({
++            try {
++                var remoteId = 0
++                while (true) {
++                    val message = readMessage()
++                    when (message.command) {
++                        A_OKAY -> remoteId = message.arg0
++                        A_WRTE -> {
++                            remoteId = message.arg0
++                            send(A_OKAY, localId, remoteId, ByteArray(0))
++                            onOutput(message.data)
++                        }
++                        A_CLSE -> break
++                    }
++                }
++            } catch (e: Exception) {
++                // The connection ended
++            }
++            onEnd()
++        }, "AdbService")
++        thread.isDaemon = true
++        thread.start()
++        return thread
++    }
++
++    fun close() {
++        transport.close()
++    }
++
++    private fun send(command: Int, arg0: Int, arg1: Int, data: ByteArray) {
++        var checksum = 0
++        for (b in data) checksum += b.toInt() and 0xFF
++        val header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
++        header.putInt(command).putInt(arg0).putInt(arg1).putInt(data.size).putInt(checksum).putInt(command xor -1)
++        synchronized(writeLock) {
++            // The header and the data go as two separate writes, as over USB they are separate transfers
++            transport.write(header.array(), 0, HEADER_SIZE)
++            var offset = 0
++            while (offset < data.size) {
++                val count = minOf(16384, data.size - offset)
++                transport.write(data, offset, count)
++                offset += count
++            }
++        }
++    }
++
++    private fun readMessage(): Message {
++        val header = ByteArray(HEADER_SIZE)
++        readFully(header)
++        val buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
++        val command = buffer.int
++        val arg0 = buffer.int
++        val arg1 = buffer.int
++        val length = buffer.int
++        buffer.int // data checksum
++        val magic = buffer.int
++        if (magic != command xor -1 || length < 0 || length > MAX_PAYLOAD) throw IOException("Bad ADB message")
++        val data = ByteArray(length)
++        if (length > 0) readFully(data)
++        return Message(command, arg0, arg1, data)
++    }
++
++    private fun readFully(buffer: ByteArray) {
++        var offset = 0
++        while (offset < buffer.size) {
++            val count = transport.read(buffer, offset, buffer.size - offset)
++            if (count < 0) throw IOException("The ADB connection closed")
++            offset += count
++        }
++    }
++
++    private companion object {
++        const val HEADER_SIZE = 24
++        const val VERSION = 0x01000000
++        const val MAX_PAYLOAD = 256 * 1024
++
++        const val A_CNXN = 0x4e584e43
++        const val A_AUTH = 0x48545541
++        const val A_OPEN = 0x4e45504f
++        const val A_OKAY = 0x59414b4f
++        const val A_CLSE = 0x45534c43
++        const val A_WRTE = 0x45545257
++
++        const val AUTH_TOKEN = 1
++        const val AUTH_SIGNATURE = 2
++        const val AUTH_RSAPUBLICKEY = 3
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbInputSession.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbInputSession.kt
+new file mode 100644
+index 00000000..d825d873
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbInputSession.kt
+@@ -0,0 +1,161 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.screenshare.adb
++
++import android.content.Context
++import android.util.DisplayMetrics
++import android.view.WindowManager
++import androidx.core.content.getSystemService
++import java.io.DataOutputStream
++import java.net.Socket
++import java.security.SecureRandom
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++/**
++ * Exact touch for the phone being controlled: the app signs in to this phone's own ADB over Wi-Fi
++ * (`localhost:5555`, switched on once with `adb tcpip 5555`, see [UsbAdbSetup]), starts [InputServer]
++ * with shell rights, and then forwards every finger to it. Unlike accessibility gestures, this follows
++ * all fingers live.
++ */
++internal object AdbInputSession {
++
++    const val ADB_PORT = 5555
++    private const val SERVER_PORT = 38417
++
++    @Volatile
++    var ready = false
++        private set
++
++    /** Last thing that happened, in plain words, to show to the user. */
++    @Volatile
++    var status = "not started"
++        private set
++
++    @Volatile
++    private var starting = false
++    private var appContext: Context? = null
++    private var connection: AdbConnection? = null
++    private var socket: Socket? = null
++    private var output: DataOutputStream? = null
++    private val sender = Executors.newSingleThreadExecutor { Thread(it, "AdbTouchSender").apply { isDaemon = true } }
++
++    /** Starts in the background if it is not running yet. [onStatus] is called on a background thread. */
++    @Synchronized
++    fun start(context: Context, onStatus: (String) -> Unit = {}) {
++        if (ready || starting) {
++            onStatus(status)
++            return
++        }
++        starting = true
++        appContext = context.applicationContext
++        Thread({
++            try {
++                report("connecting to ADB…", onStatus)
++                connect(context.applicationContext, onStatus)
++                report("ready", onStatus)
++            } catch (e: Exception) {
++                ready = false
++                report("failed: ${e.message ?: e.javaClass.simpleName}", onStatus)
++                stop()
++            } finally {
++                starting = false
++            }
++        }, "AdbInputStart").start()
++    }
++
++    private fun report(text: String, onStatus: (String) -> Unit) {
++        status = text
++        onStatus(text)
++    }
++
++    private fun connect(context: Context, onStatus: (String) -> Unit) {
++        val key = AdbKey.load(context)
++        val adb = AdbConnection(TcpAdbTransport("127.0.0.1", ADB_PORT), key)
++        adb.onWaitingForUser = { report("tap \"Allow\" on this phone's USB debugging question", onStatus) }
++        adb.connect()
++        connection = adb
++
++        val secret = ByteArray(12).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
++        val apk = context.applicationInfo.sourceDir
++        val latch = CountDownLatch(1)
++        val error = StringBuilder()
++        adb.openService(
++            "shell:CLASSPATH=$apk app_process /system/bin ${InputServer::class.java.name} $SERVER_PORT $secret",
++            onOutput = { bytes ->
++                val text = String(bytes)
++                if (text.contains("READY")) latch.countDown()
++                if (text.contains("ERROR")) {
++                    error.append(text.trim())
++                    latch.countDown()
++                }
++            },
++            onEnd = { ready = false }
++        )
++        if (!latch.await(10, TimeUnit.SECONDS) || error.isNotEmpty()) {
++            throw IllegalStateException(if (error.isNotEmpty()) error.toString() else "the touch helper did not start")
++        }
++
++        val connected = Socket("127.0.0.1", SERVER_PORT)
++        connected.tcpNoDelay = true
++        val stream = DataOutputStream(connected.getOutputStream().buffered(4096))
++        stream.writeUTF(secret)
++        stream.flush()
++        socket = connected
++        output = stream
++        ready = true
++    }
++
++    /** Sends the fingers currently on screen. [action] is "down", "move", "up" or "cancel". */
++    fun touch(action: String, changedId: Int, points: Map<Int, Pair<Float, Float>>) {
++        val code = when (action) {
++            "down" -> InputServer.ACTION_DOWN
++            "move" -> InputServer.ACTION_MOVE
++            "up" -> InputServer.ACTION_UP
++            "cancel" -> InputServer.ACTION_CANCEL
++            else -> return
++        }
++        val size = screenSize() ?: return
++        sender.execute {
++            val stream = output ?: return@execute
++            try {
++                stream.writeByte(1)
++                stream.writeByte(code)
++                stream.writeInt(changedId)
++                stream.writeInt(size.first)
++                stream.writeInt(size.second)
++                stream.writeByte(points.size)
++                for ((id, point) in points) {
++                    stream.writeInt(id)
++                    stream.writeFloat(point.first)
++                    stream.writeFloat(point.second)
++                }
++                stream.flush()
++            } catch (e: Exception) {
++                ready = false
++                status = "lost the connection"
++            }
++        }
++    }
++
++    @Suppress("DEPRECATION") // Display.getRealMetrics is the only way to get the full size on API < 30
++    private fun screenSize(): Pair<Int, Int>? {
++        val metrics = DisplayMetrics()
++        appContext?.getSystemService<WindowManager>()?.defaultDisplay?.getRealMetrics(metrics) ?: return null
++        return if (metrics.widthPixels > 0 && metrics.heightPixels > 0) metrics.widthPixels to metrics.heightPixels else null
++    }
++
++    @Synchronized
++    fun stop() {
++        ready = false
++        runCatching { socket?.close() }
++        runCatching { connection?.close() }
++        socket = null
++        output = null
++        connection = null
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbKey.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbKey.kt
+new file mode 100644
+index 00000000..6471a62d
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/AdbKey.kt
+@@ -0,0 +1,89 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.screenshare.adb
++
++import android.content.Context
++import android.util.Base64
++import java.io.File
++import java.math.BigInteger
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.security.KeyFactory
++import java.security.KeyPairGenerator
++import java.security.PrivateKey
++import java.security.Signature
++import java.security.interfaces.RSAPublicKey
++import java.security.spec.PKCS8EncodedKeySpec
++import java.security.spec.X509EncodedKeySpec
++
++/**
++ * The RSA key this app uses to introduce itself to ADB ("Allow USB debugging?"). It is created once
++ * and kept in the app's private storage, so the phone only asks the first time.
++ */
++internal class AdbKey private constructor(private val privateKey: PrivateKey, private val publicKey: RSAPublicKey) {
++
++    /** Signs the 20 byte token ADB sends. ADB treats the token as an already computed SHA-1 hash. */
++    fun sign(token: ByteArray): ByteArray {
++        val signature = Signature.getInstance("NONEwithRSA")
++        signature.initSign(privateKey)
++        signature.update(SHA1_DIGEST_INFO_PREFIX)
++        signature.update(token)
++        return signature.sign()
++    }
++
++    /** The public key in the format ADB expects: base64 of its own structure, a name, and a 0 byte. */
++    fun publicKeyForAdb(): ByteArray {
++        val n = publicKey.modulus
++        val e = publicKey.publicExponent
++        val r32 = BigInteger.ONE.shiftLeft(32)
++        val n0inv = r32.subtract(n.mod(r32).modInverse(r32)).toLong()
++        val rr = BigInteger.ONE.shiftLeft(KEY_WORDS * 32 * 2).mod(n)
++
++        val buffer = ByteBuffer.allocate(4 + 4 + KEY_WORDS * 4 * 2 + 4).order(ByteOrder.LITTLE_ENDIAN)
++        buffer.putInt(KEY_WORDS)
++        buffer.putInt(n0inv.toInt())
++        putWords(buffer, n)
++        putWords(buffer, rr)
++        buffer.putInt(e.toInt())
++
++        val text = Base64.encodeToString(buffer.array(), Base64.NO_WRAP) + " kdeconnect@phone"
++        return text.toByteArray(Charsets.US_ASCII) + byteArrayOf(0)
++    }
++
++    private fun putWords(buffer: ByteBuffer, value: BigInteger) {
++        val mask = BigInteger.valueOf(0xFFFFFFFFL)
++        for (i in 0 until KEY_WORDS) {
++            buffer.putInt(value.shiftRight(32 * i).and(mask).toLong().toInt())
++        }
++    }
++
++    companion object {
++        private const val KEY_WORDS = 64 // 2048 bits
++        private val SHA1_DIGEST_INFO_PREFIX = byteArrayOf(
++            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
++        )
++
++        fun load(context: Context): AdbKey {
++            val privateFile = File(context.filesDir, "adb_key.private")
++            val publicFile = File(context.filesDir, "adb_key.public")
++            val factory = KeyFactory.getInstance("RSA")
++            if (privateFile.exists() && publicFile.exists()) {
++                runCatching {
++                    return AdbKey(
++                        factory.generatePrivate(PKCS8EncodedKeySpec(privateFile.readBytes())),
++                        factory.generatePublic(X509EncodedKeySpec(publicFile.readBytes())) as RSAPublicKey
++                    )
++                }
++            }
++            val generator = KeyPairGenerator.getInstance("RSA")
++            generator.initialize(KEY_WORDS * 32)
++            val pair = generator.generateKeyPair()
++            privateFile.writeBytes(pair.private.encoded)
++            publicFile.writeBytes(pair.public.encoded)
++            return AdbKey(pair.private, pair.public as RSAPublicKey)
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/InputServer.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/InputServer.kt
+new file mode 100644
+index 00000000..50f5eb2b
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/adb/InputServer.kt
+@@ -0,0 +1,170 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.screenshare.adb
++
++import android.os.SystemClock
++import android.view.InputDevice
++import android.view.InputEvent
++import android.view.MotionEvent
++import java.io.DataInputStream
++import java.lang.reflect.Method
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++
++/**
++ * This is NOT run inside the app. ADB starts it as a separate process with "shell" rights
++ * (`app_process`), which is what Android requires to inject touches into any app. That is how
++ * scrcpy works too. The app then connects to it on the phone's own loopback address and sends
++ * every finger as it moves.
++ *
++ * Usage: InputServer <port> <secret>
++ * It prints READY when it is listening, or ERROR followed by the reason.
++ */
++object InputServer {
++
++    private class Finger(var x: Float, var y: Float)
++
++    private val fingers = LinkedHashMap<Int, Finger>()
++    private var downTime = 0L
++    private var injectTarget: Any? = null
++    private var injectMethod: Method? = null
++
++    @JvmStatic
++    fun main(args: Array<String>) {
++        try {
++            val port = args[0].toInt()
++            val secret = args[1]
++            val inputManagerClass = Class.forName("android.hardware.input.InputManager")
++            injectTarget = inputManagerClass.getDeclaredMethod("getInstance").invoke(null)
++            injectMethod = inputManagerClass.getMethod("injectInputEvent", InputEvent::class.java, Integer.TYPE)
++
++            val server = ServerSocket(port, 2, InetAddress.getByName("127.0.0.1"))
++            println("READY")
++            System.out.flush()
++            while (true) {
++                val client = server.accept()
++                try {
++                    serve(client, secret)
++                } catch (e: Exception) {
++                    // The app went away; wait for the next connection
++                } finally {
++                    runCatching { client.close() }
++                    release()
++                }
++            }
++        } catch (e: Throwable) {
++            println("ERROR " + e)
++            System.out.flush()
++        }
++    }
++
++    private fun serve(client: Socket, secret: String) {
++        client.tcpNoDelay = true
++        val input = DataInputStream(client.getInputStream().buffered())
++        // Other apps can reach this port too, so only the one that knows the secret may use it
++        if (input.readUTF() != secret) return
++        while (true) {
++            val type = input.readByte().toInt()
++            if (type != 1) return
++            val action = input.readByte().toInt()
++            val changedId = input.readInt()
++            val width = input.readInt()
++            val height = input.readInt()
++            val count = input.readByte().toInt()
++            val ids = IntArray(count)
++            val xs = FloatArray(count)
++            val ys = FloatArray(count)
++            for (i in 0 until count) {
++                ids[i] = input.readInt()
++                xs[i] = input.readFloat()
++                ys[i] = input.readFloat()
++            }
++            handle(action, changedId, width, height, ids, xs, ys)
++        }
++    }
++
++    private fun handle(action: Int, changedId: Int, width: Int, height: Int, ids: IntArray, xs: FloatArray, ys: FloatArray) {
++        if (width <= 0 || height <= 0) return
++        // Update where every finger is
++        for (i in ids.indices) {
++            val x = xs[i].coerceIn(0f, 1f) * (width - 1)
++            val y = ys[i].coerceIn(0f, 1f) * (height - 1)
++            val existing = fingers[ids[i]]
++            if (existing != null) {
++                existing.x = x
++                existing.y = y
++            } else if (action == ACTION_DOWN && ids[i] == changedId) {
++                fingers[ids[i]] = Finger(x, y)
++            }
++        }
++
++        when (action) {
++            ACTION_DOWN -> {
++                val index = indexOf(changedId)
++                if (index < 0) return
++                if (fingers.size == 1) downTime = SystemClock.uptimeMillis()
++                inject(if (fingers.size == 1) MotionEvent.ACTION_DOWN else pointerAction(MotionEvent.ACTION_POINTER_DOWN, index))
++            }
++            ACTION_MOVE -> if (fingers.isNotEmpty()) inject(MotionEvent.ACTION_MOVE)
++            ACTION_UP -> {
++                val index = indexOf(changedId)
++                if (index < 0) return
++                inject(if (fingers.size == 1) MotionEvent.ACTION_UP else pointerAction(MotionEvent.ACTION_POINTER_UP, index))
++                fingers.remove(changedId)
++            }
++            ACTION_CANCEL -> {
++                if (fingers.isNotEmpty()) inject(MotionEvent.ACTION_CANCEL)
++                fingers.clear()
++            }
++        }
++    }
++
++    private fun indexOf(id: Int): Int = fingers.keys.indexOf(id)
++
++    private fun pointerAction(base: Int, index: Int): Int = base or (index shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
++
++    private fun inject(action: Int) {
++        val count = fingers.size
++        val properties = Array(count) { MotionEvent.PointerProperties() }
++        val coordinates = Array(count) { MotionEvent.PointerCoords() }
++        var i = 0
++        for ((id, finger) in fingers) {
++            properties[i].id = id.coerceIn(0, 31)
++            properties[i].toolType = MotionEvent.TOOL_TYPE_FINGER
++            coordinates[i].x = finger.x
++            coordinates[i].y = finger.y
++            coordinates[i].pressure = 1f
++            coordinates[i].size = 1f
++            i++
++        }
++        val now = SystemClock.uptimeMillis()
++        val event = MotionEvent.obtain(
++            downTime, now, action, count, properties, coordinates,
++            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
++        )
++        try {
++            injectMethod?.invoke(injectTarget, event, INJECT_ASYNC)
++        } finally {
++            event.recycle()
++        }
++    }
++
++    /** Lifts everything if the app disappears, so no finger stays stuck on the screen. */
++    private fun release() {
++        if (fingers.isNotEmpty()) {
++            runCatching { inject(MotionEvent.ACTION_CANCEL) }
++            fingers.clear()
++        }
++    }
++
++    const val ACTION_DOWN = 0
++    const val ACTION_UP = 1
++    const val ACTION_MOVE = 2
++    const val ACTION_CANCEL = 3
++
++    private const val INJECT_ASYNC = 0
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt
 new file mode 100644
@@ -4843,10 +5547,10 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..258af4eb 100644
+index d8b73918..4a754f4f 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,105 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +671,107 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -4939,6 +5643,8 @@ index d8b73918..258af4eb 100644
 +    <string name="screenshare_power_wake">Wake the screen</string>
 +    <string name="screenshare_sound_no_permission">Sound is off: the microphone permission was not allowed, which Android needs to capture sound.</string>
 +    <string name="screenshare_sound_failed">This phone could not capture its sound, so only the screen is shared.</string>
++    <string name="screenshare_adb_setup">Set up exact touch (ADB) on this phone</string>
++    <string name="screenshare_adb_status">Exact touch: %1$s</string>
 +    <string name="screenshare_limit_title">Session limit</string>
 +    <string name="screenshare_limit_unlimited">Unlimited</string>
 +    <string name="screenshare_limit_minutes">%1$d minutes</string>
