@@ -54,6 +54,150 @@ index 8bf7ff8c..a12b2e61 100644
          <activity
              android:name="org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity"
              android:theme="@style/Theme.Transparent"
+diff --git a/src/main/java/org/kde/kdeconnect/BackgroundService.kt b/src/main/java/org/kde/kdeconnect/BackgroundService.kt
+index e3a11628..5b1906ef 100644
+--- a/src/main/java/org/kde/kdeconnect/BackgroundService.kt
++++ b/src/main/java/org/kde/kdeconnect/BackgroundService.kt
+@@ -33,6 +33,7 @@ import org.kde.kdeconnect.backends.bluetooth.BluetoothLinkProvider
+ import org.kde.kdeconnect.backends.lan.LanLinkProvider
+ import org.kde.kdeconnect.helpers.NotificationHelper
+ import org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity
++import org.kde.kdeconnect.plugins.battery.BatteryPlugin
+ import org.kde.kdeconnect.plugins.clipboard.ClipboardPlugin
+ import org.kde.kdeconnect.plugins.runcommand.RunCommandActivity
+ import org.kde.kdeconnect.plugins.runcommand.RunCommandPlugin
+@@ -149,6 +150,19 @@ class BackgroundService : Service() {
+         }
+     }
+ 
++    /** "Phone name · 77% ⚡ · Wi-Fi": the basics of a connected phone, for the notification. */
++    private fun deviceSummary(device: Device): String {
++        val parts = ArrayList<String>()
++        device.getPlugin(BatteryPlugin::class.java)?.remoteBatteryInfo?.let { info ->
++            parts.add("${info.currentCharge}%" + if (info.isCharging) " ⚡" else "")
++        }
++        when (device.connectivityType) {
++            "BluetoothLink" -> parts.add("Bluetooth")
++            "LanLink" -> parts.add("Wi-Fi")
++        }
++        return if (parts.isEmpty()) device.name else device.name + " · " + parts.joinToString(" · ")
++    }
++
+     private fun createForegroundNotification(): Notification {
+         // Why is this needed: https://developer.android.com/guide/components/services#Foreground
+ 
+@@ -157,7 +171,7 @@ class BackgroundService : Service() {
+         for (device in applicationInstance.devices.values) {
+             if (device.isReachable && device.isPaired) {
+                 connectedDeviceIds.add(device.deviceId)
+-                connectedDevices.add(device.name)
++                connectedDevices.add(deviceSummary(device))
+             }
+         }
+ 
+@@ -191,7 +205,11 @@ class BackgroundService : Service() {
+             notification.setContentText(getString(R.string.foreground_notification_no_devices))
+         }
+         else {
+-            notification.setContentText(getString(R.string.foreground_notification_devices, connectedDevices.joinToString(", ")))
++            notification.setContentText(getString(R.string.foreground_notification_devices, connectedDevices.joinToString(" | ")))
++            // Expanded: one line per phone, with its battery and how it is connected
++            notification.setStyle(
++                NotificationCompat.BigTextStyle().bigText(connectedDevices.joinToString("\n"))
++            )
+ 
+             // Adding an action button to send clipboard manually in Android 10 and later.
+             if (!ClipboardPlugin.canSyncAutomatically(this)) {
+diff --git a/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt b/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
+index bdc20f31..967c778b 100644
+--- a/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
++++ b/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
+@@ -8,6 +8,7 @@ package org.kde.kdeconnect.backends.bluetooth
+ 
+ import android.annotation.SuppressLint
+ import android.bluetooth.BluetoothAdapter
++import android.bluetooth.BluetoothClass
+ import android.bluetooth.BluetoothDevice
+ import android.bluetooth.BluetoothServerSocket
+ import android.bluetooth.BluetoothSocket
+@@ -73,7 +74,14 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+ 
+     override fun onStart() {
+         val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+-        if (!preferences.getBoolean(SettingsFragment.KEY_BLUETOOTH_ENABLED, false)) {
++        val linkMode = preferences.getString(SettingsFragment.KEY_LINK_MODE, SettingsFragment.LINK_MODE_AUTO)
++        if (linkMode == SettingsFragment.LINK_MODE_WIFI) {
++            return // The user chose Wi-Fi only
++        }
++        // "Bluetooth only" switches Bluetooth on by itself
++        val enabled = preferences.getBoolean(SettingsFragment.KEY_BLUETOOTH_ENABLED, false) ||
++            linkMode == SettingsFragment.LINK_MODE_BLUETOOTH
++        if (!enabled) {
+             return
+         }
+         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+@@ -242,13 +250,19 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+                 val filter = IntentFilter(BluetoothDevice.ACTION_UUID)
+                 context.registerReceiver(this, filter)
+                 Log.i("ClientRunnable", "receiver registered")
+-                if (continueProcessing) {
++                // Keep trying while Bluetooth is on: the other phone may switch it on later, and
++                // answers to the first search are often lost
++                while (continueProcessing) {
+                     Log.i("ClientRunnable", "before connectToDevices")
+                     discoverDeviceServices()
+                     Log.i("ClientRunnable", "after connectToDevices")
+-                    try {
+-                        Thread.sleep(15000)
+-                    } catch (_: InterruptedException) {
++                    var waited = 0
++                    while (continueProcessing && waited < RETRY_EVERY_MS) {
++                        try {
++                            Thread.sleep(1000)
++                        } catch (_: InterruptedException) {
++                        }
++                        waited += 1000
+                     }
+                 }
+                 Log.i("ClientRunnable", "unregisteringReceiver")
+@@ -283,6 +297,12 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+                 }
+                 Log.i("ClientRunnable", "Calling fetchUuidsWithSdp for device: $device")
+                 device.fetchUuidsWithSdp()
++                // The list of services is often empty or old, so also try phones and computers
++                // directly: it simply fails if KDE Connect isn't running over there
++                val kind = device.bluetoothClass?.majorDeviceClass
++                if (kind == BluetoothClass.Device.Major.PHONE || kind == BluetoothClass.Device.Major.COMPUTER) {
++                    connectToDevice(device)
++                }
+                 val deviceUuids = device.uuids
+                 if (deviceUuids != null) {
+                     for (thisUuid in deviceUuids) {
+@@ -422,6 +442,7 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+     }
+ 
+     companion object {
++        private const val RETRY_EVERY_MS = 20_000
+         private val SERVICE_UUID = UUID.fromString("185f3df4-3268-4e3f-9fca-d4d5059915bd")
+         private val BYTE_REVERSED_SERVICE_UUID = UUID(java.lang.Long.reverseBytes(SERVICE_UUID.leastSignificantBits), java.lang.Long.reverseBytes(SERVICE_UUID.mostSignificantBits))
+     }
+diff --git a/src/main/java/org/kde/kdeconnect/backends/lan/LanLinkProvider.kt b/src/main/java/org/kde/kdeconnect/backends/lan/LanLinkProvider.kt
+index 57cc2632..a80ff2cd 100644
+--- a/src/main/java/org/kde/kdeconnect/backends/lan/LanLinkProvider.kt
++++ b/src/main/java/org/kde/kdeconnect/backends/lan/LanLinkProvider.kt
+@@ -576,6 +576,12 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
+ 
+     override fun onStart() {
+         //Log.i("KDE/LanLinkProvider", "onStart");
++        val linkMode = androidx.preference.PreferenceManager.getDefaultSharedPreferences(context)
++            .getString(org.kde.kdeconnect.ui.SettingsFragment.KEY_LINK_MODE, org.kde.kdeconnect.ui.SettingsFragment.LINK_MODE_AUTO)
++        if (linkMode == org.kde.kdeconnect.ui.SettingsFragment.LINK_MODE_BLUETOOTH) {
++            isStopped = true // The user chose Bluetooth only: stay off Wi-Fi
++            return
++        }
+         isStopped = false
+ 
+         updateCustomDevicesList()
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureConsentActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/audiostream/AudioCaptureConsentActivity.kt
 new file mode 100644
 index 00000000..855e5557
@@ -6009,6 +6153,111 @@ index 841662fa..89a6f8b1 100644
          init {
              System.setProperty(SECURITY_PROVIDER_REGISTRARS, "") // disable BouncyCastle
              System.setProperty(
+diff --git a/src/main/java/org/kde/kdeconnect/ui/SettingsFragment.kt b/src/main/java/org/kde/kdeconnect/ui/SettingsFragment.kt
+index f0f38ada..5423277c 100644
+--- a/src/main/java/org/kde/kdeconnect/ui/SettingsFragment.kt
++++ b/src/main/java/org/kde/kdeconnect/ui/SettingsFragment.kt
+@@ -6,6 +6,7 @@
+ package org.kde.kdeconnect.ui
+ 
+ import android.Manifest
++import android.annotation.SuppressLint
+ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.PackageManager
+@@ -65,7 +66,9 @@ class SettingsFragment : PreferenceFragmentCompat() {
+             persistentNotificationPref(context),
+             trustedNetworkPref(context),
+             devicesByIpPref(context),
++            linkModePref(context),
+             bluetoothSupportPref(context),
++            bluetoothCheckPref(context),
+             exportLogsPref(context),
+             moreSettingsPref(context),
+         ).forEach(screen::addPreference)
+@@ -216,6 +219,71 @@ class SettingsFragment : PreferenceFragmentCompat() {
+         }
+     }
+ 
++    /** How the phones find each other: Wi-Fi, Bluetooth, or both with Bluetooth as the backup. */
++    private fun linkModePref(context: Context) = ListPreference(context).apply {
++        key = KEY_LINK_MODE
++        setDefaultValue(LINK_MODE_AUTO)
++        setTitle(R.string.link_mode_title)
++        entries = arrayOf(
++            context.getString(R.string.link_mode_auto),
++            context.getString(R.string.link_mode_wifi),
++            context.getString(R.string.link_mode_bluetooth),
++        )
++        entryValues = arrayOf(LINK_MODE_AUTO, LINK_MODE_WIFI, LINK_MODE_BLUETOOTH)
++        summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
++        onPreferenceChangeListener = Preference.OnPreferenceChangeListener { _: Preference?, newValue: Any ->
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && newValue != LINK_MODE_WIFI) {
++                val permissions = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
++                if (!permissions.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }) {
++                    bluetoothPermissionsLauncher.launch(permissions)
++                }
++            }
++            // Restarts the link providers. The preference is saved before the service handles this.
++            BackgroundService.ForceRefreshConnections(context)
++            true
++        }
++    }
++
++    /** Shows why Bluetooth might not connect: what is on, what is missing, and which phones are paired. */
++    @SuppressLint("MissingPermission")
++    private fun bluetoothCheckPref(context: Context) = Preference(context).apply {
++        isPersistent = false
++        setTitle(R.string.bluetooth_check_title)
++        setSummary(R.string.bluetooth_check_summary)
++        onPreferenceClickListener = Preference.OnPreferenceClickListener {
++            val prefs = androidx.preference.PreferenceManager.getDefaultSharedPreferences(context)
++            val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
++            val permissionsGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
++                listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
++                    .all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
++            fun yesNo(value: Boolean) = context.getString(if (value) R.string.bluetooth_check_yes else R.string.bluetooth_check_no)
++
++            val paired = if (adapter == null || !permissionsGranted) emptyList() else
++                runCatching { adapter.bondedDevices.toList() }.getOrDefault(emptyList())
++            val report = StringBuilder()
++            report.append(context.getString(R.string.bluetooth_check_adapter, yesNo(adapter != null))).append('\n')
++            report.append(context.getString(R.string.bluetooth_check_on, yesNo(adapter?.isEnabled == true))).append('\n')
++            report.append(context.getString(R.string.bluetooth_check_permission, yesNo(permissionsGranted))).append('\n')
++            report.append(context.getString(R.string.bluetooth_check_switch, yesNo(prefs.getBoolean(KEY_BLUETOOTH_ENABLED, false) ||
++                prefs.getString(KEY_LINK_MODE, LINK_MODE_AUTO) == LINK_MODE_BLUETOOTH))).append('\n')
++            report.append(context.getString(R.string.bluetooth_check_mode, prefs.getString(KEY_LINK_MODE, LINK_MODE_AUTO))).append("\n\n")
++            report.append(context.getString(R.string.bluetooth_check_paired, paired.size)).append('\n')
++            paired.forEach { report.append(" - ").append(it.name).append('\n') }
++            report.append('\n').append(context.getString(R.string.bluetooth_check_help))
++
++            MaterialAlertDialogBuilder(requireContext())
++                .setTitle(R.string.bluetooth_check_title)
++                .setMessage(report.toString())
++                .setPositiveButton(R.string.bluetooth_check_open_settings) { _, _ ->
++                    startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS))
++                }
++                .setNeutralButton(R.string.bluetooth_check_retry) { _, _ -> BackgroundService.ForceRefreshConnections(context) }
++                .setNegativeButton(R.string.ok, null)
++                .show()
++            true
++        }
++    }
++
+     private fun bluetoothSupportPref(context: Context) = SwitchPreference(context).apply {
+         setDefaultValue(false)
+         key = KEY_BLUETOOTH_ENABLED
+@@ -277,6 +345,10 @@ class SettingsFragment : PreferenceFragmentCompat() {
+ 
+     companion object {
+         const val KEY_BLUETOOTH_ENABLED: String = "bluetooth_enabled"
++        const val KEY_LINK_MODE: String = "link_mode"
++        const val LINK_MODE_AUTO: String = "auto"
++        const val LINK_MODE_WIFI: String = "wifi"
++        const val LINK_MODE_BLUETOOTH: String = "bluetooth"
+         const val KEY_APP_THEME: String = "theme_pref"
+     }
+ }
 diff --git a/src/main/res/drawable/ic_file.xml b/src/main/res/drawable/ic_file.xml
 new file mode 100644
 index 00000000..afb87d85
@@ -6050,10 +6299,34 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..b94be6f9 100644
+index d8b73918..d6186d6e 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,119 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -631,6 +631,23 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="plugin_stats">Plugin stats</string>
+ 
+     <string name="enable_udp_broadcast">Enable UDP device discovery</string>
++    <string name="link_mode_title">Connection type</string>
++    <string name="link_mode_auto">Automatic: Wi-Fi, with Bluetooth as backup</string>
++    <string name="link_mode_wifi">Wi-Fi only</string>
++    <string name="link_mode_bluetooth">Bluetooth only (no Wi-Fi needed)</string>
++    <string name="bluetooth_check_title">Bluetooth check</string>
++    <string name="bluetooth_check_summary">Find out why Bluetooth does not connect</string>
++    <string name="bluetooth_check_yes">yes</string>
++    <string name="bluetooth_check_no">NO</string>
++    <string name="bluetooth_check_adapter">This phone has Bluetooth: %1$s</string>
++    <string name="bluetooth_check_on">Bluetooth is turned on: %1$s</string>
++    <string name="bluetooth_check_permission">Nearby devices permission given: %1$s</string>
++    <string name="bluetooth_check_switch">Bluetooth is enabled in KDE Connect: %1$s</string>
++    <string name="bluetooth_check_mode">Connection type: %1$s</string>
++    <string name="bluetooth_check_paired">Phones paired in Android Bluetooth settings: %1$d</string>
++    <string name="bluetooth_check_help">To connect over Bluetooth: pair the two phones in Android\'s Bluetooth settings first, turn on Bluetooth and "Enable bluetooth" in KDE Connect on BOTH phones, and keep KDE Connect open. It tries again every 20 seconds. Bluetooth is slow, so use the Bluetooth (tiny picture) screen preset.</string>
++    <string name="bluetooth_check_open_settings">Bluetooth settings</string>
++    <string name="bluetooth_check_retry">Try again now</string>
+     <string name="enable_bluetooth">Enable bluetooth (beta)</string>
+ 
+     <string name="receive_notifications_permission_explanation">Notifications need to be allowed to receive them from other devices</string>
+@@ -671,4 +688,119 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
