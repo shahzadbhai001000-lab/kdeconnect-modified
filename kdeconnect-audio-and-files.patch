@@ -2763,10 +2763,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..a0ff2d3a
+index 00000000..40b72425
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,724 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2798,6 +2798,7 @@ index 00000000..a0ff2d3a
 +import android.widget.SeekBar
 +import android.widget.TextView
 +import android.view.KeyEvent
++import android.view.MotionEvent
 +import android.widget.Toast
 +import androidx.activity.ComponentActivity
 +import androidx.core.view.WindowCompat
@@ -2821,6 +2822,18 @@ index 00000000..a0ff2d3a
 +    private lateinit var statsView: TextView
 +    private lateinit var statusView: TextView
 +    private lateinit var controlButton: Button
++    private lateinit var resizePanel: LinearLayout
++
++    // Resize mode: drag to move the picture, pinch to resize it. Touches are not sent meanwhile.
++    private var resizeMode = false
++    private var sizeW = 100f
++    private var sizeH = 100f
++    private var shiftX = 0f
++    private var shiftY = 0f
++    private var resizeLastX = 0f
++    private var resizeLastY = 0f
++    private var resizeLastDist = 0f
++    private var resizeLastCount = 0
 +    private lateinit var touchSender: TouchGestureSender
 +
 +    private val handler = Handler(Looper.getMainLooper())
@@ -2963,6 +2976,7 @@ index 00000000..a0ff2d3a
 +        }
 +        bar.addView(barButton(R.string.screenshare_button_settings) { showSettingsMenu() })
 +        bar.addView(barButton(R.string.screenshare_button_stats) { toggleStats() })
++        bar.addView(barButton(R.string.screenshare_button_size) { toggleResize() })
 +        controlButton = barButton(controlLabel()) { toggleControl() }
 +        bar.addView(controlButton)
 +        bar.addView(barButton(R.string.screenshare_button_stop) { stopAndClose() })
@@ -2988,7 +3002,136 @@ index 00000000..a0ff2d3a
 +                .apply { setMargins(0, 0, 0, dp(8)) }
 +        )
 +
++        // Shown while resizing: what to do, and quick ways to finish
++        resizePanel = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            gravity = Gravity.CENTER_HORIZONTAL
++            setBackgroundColor(0xCC000000.toInt())
++            setPadding(dp(12), dp(8), dp(12), dp(8))
++            visibility = View.GONE
++        }
++        resizePanel.addView(TextView(this).apply {
++            setTextColor(Color.WHITE)
++            gravity = Gravity.CENTER
++            setText(R.string.screenshare_resize_hint)
++        })
++        val resizeButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
++        resizeButtons.addView(barButton(R.string.screenshare_resize_fill) { finishResize(ScreenShareSettings.VIEW_FILL) })
++        resizeButtons.addView(barButton(R.string.screenshare_resize_fit) { finishResize(ScreenShareSettings.VIEW_FIT) })
++        resizeButtons.addView(barButton(R.string.screenshare_resize_done) { finishResize(ScreenShareSettings.VIEW_CUSTOM) })
++        resizePanel.addView(resizeButtons)
++        root.addView(
++            resizePanel,
++            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
++                .apply { setMargins(0, 0, 0, dp(52)) }
++        )
++        // While resizing, the picture lets touches through to here, which don't move with the picture
++        root.setOnTouchListener { _, event ->
++            if (resizeMode) {
++                handleResizeTouch(event, root.width.toFloat(), root.height.toFloat())
++                true
++            } else {
++                false
++            }
++        }
++
 +        return root
++    }
++
++    private fun toggleResize() {
++        if (resizeMode) finishResize(ScreenShareSettings.VIEW_CUSTOM) else startResize()
++    }
++
++    private fun startResize() {
++        touchSender.reset()
++        // Start from how the picture looks now, whichever size mode it was in
++        val parentView = surfaceView.parent as View
++        if (settings.viewMode == ScreenShareSettings.VIEW_CUSTOM) {
++            sizeW = settings.customWidth.toFloat()
++            sizeH = settings.customHeight.toFloat()
++            shiftX = settings.customShiftX.toFloat()
++            shiftY = settings.customShiftY.toFloat()
++        } else {
++            sizeW = surfaceView.measuredWidth * 100f / parentView.width.coerceAtLeast(1)
++            sizeH = surfaceView.measuredHeight * 100f / parentView.height.coerceAtLeast(1)
++            shiftX = 0f
++            shiftY = 0f
++        }
++        settings.viewMode = ScreenShareSettings.VIEW_CUSTOM
++        surfaceView.setMode(ScreenShareSettings.VIEW_CUSTOM)
++        saveAndApplyResize()
++        resizeMode = true
++        resizeLastCount = 0
++        resizePanel.visibility = View.VISIBLE
++    }
++
++    /** @param mode the size mode to end up in: custom keeps the picture where it is now */
++    private fun finishResize(mode: String) {
++        resizeMode = false
++        resizePanel.visibility = View.GONE
++        settings.viewMode = mode
++        surfaceView.setMode(mode)
++        if (mode == ScreenShareSettings.VIEW_CUSTOM) saveAndApplyResize()
++    }
++
++    private fun saveAndApplyResize() {
++        settings.customWidth = sizeW.toInt()
++        settings.customHeight = sizeH.toInt()
++        settings.customShiftX = shiftX.toInt()
++        settings.customShiftY = shiftY.toInt()
++        applyCustomSize()
++    }
++
++    /** One finger moves the picture, two fingers resize it (and move it with them). */
++    private fun handleResizeTouch(event: MotionEvent, parentWidth: Float, parentHeight: Float) {
++        if (parentWidth <= 0f || parentHeight <= 0f) return
++        // Pointers that are going up don't count
++        val lifting = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
++        var count = 0
++        var cx = 0f
++        var cy = 0f
++        for (i in 0 until event.pointerCount) {
++            if (i == lifting) continue
++            cx += event.getX(i)
++            cy += event.getY(i)
++            count++
++        }
++        if (count == 0) return
++        cx /= count
++        cy /= count
++        var dist = 0f
++        if (count >= 2) {
++            val indices = (0 until event.pointerCount).filter { it != lifting }
++            dist = Math.hypot(
++                (event.getX(indices[0]) - event.getX(indices[1])).toDouble(),
++                (event.getY(indices[0]) - event.getY(indices[1])).toDouble()
++            ).toFloat()
++        }
++
++        when (event.actionMasked) {
++            MotionEvent.ACTION_MOVE -> if (count == resizeLastCount) {
++                shiftX += (cx - resizeLastX) / parentWidth * 100f
++                shiftY += (cy - resizeLastY) / parentHeight * 100f
++                if (count >= 2 && resizeLastDist > 0f && dist > 0f) {
++                    val factor = dist / resizeLastDist
++                    sizeW = (sizeW * factor).coerceIn(MIN_PERCENT, MAX_PERCENT)
++                    sizeH = (sizeH * factor).coerceIn(MIN_PERCENT, MAX_PERCENT)
++                }
++                shiftX = shiftX.coerceIn(-100f, 100f)
++                shiftY = shiftY.coerceIn(-100f, 100f)
++                surfaceView.setCustom(sizeW.toInt(), sizeH.toInt(), shiftX.toInt(), shiftY.toInt())
++            }
++            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
++                saveAndApplyResize()
++                resizeLastCount = 0
++                return
++            }
++        }
++        // Remember where the fingers are, so the next move is measured from here
++        resizeLastX = cx
++        resizeLastY = cy
++        resizeLastDist = dist
++        resizeLastCount = count
 +    }
 +
 +    private fun barButton(textRes: Int, onClick: () -> Unit): Button = Button(this).apply {
@@ -3068,6 +3211,7 @@ index 00000000..a0ff2d3a
 +            slopPx = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
 +        )
 +        surfaceView.setOnTouchListener { view, event ->
++            if (resizeMode) return@setOnTouchListener false // the screen behind handles the resizing
 +            if (!settings.controlEnabled || decoder == null) return@setOnTouchListener false
 +            touchSender.onTouch(view, event)
 +            true
@@ -3201,7 +3345,7 @@ index 00000000..a0ff2d3a
 +            val text = TextView(this)
 +            val bar = SeekBar(this).apply {
 +                this.max = max - min
-+                progress = value - min
++                progress = (value - min).coerceIn(0, max - min)
 +            }
 +            fun show(v: Int) { text.text = getString(label, v) }
 +            show(value)
@@ -3342,6 +3486,8 @@ index 00000000..a0ff2d3a
 +        const val EXTRA_DEVICE_ID = "deviceId"
 +        const val EXTRA_AUTO_REQUEST = "autoRequest"
 +        private const val STATS_INTERVAL_MS = 1000L
++        private const val MIN_PERCENT = 20f
++        private const val MAX_PERCENT = 300f
 +
 +    }
 +}
@@ -5904,10 +6050,10 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..67f00159 100644
+index d8b73918..b94be6f9 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -671,4 +671,114 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +671,119 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -5992,6 +6138,11 @@ index d8b73918..67f00159 100644
 +    <string name="screenshare_size_fill">Fill the screen (stretch)</string>
 +    <string name="screenshare_size_fit">Fit (keep proportions)</string>
 +    <string name="screenshare_size_zoom">Zoom (fill, crop the edges)</string>
++    <string name="screenshare_button_size">Size</string>
++    <string name="screenshare_resize_hint">Drag to move the picture, pinch to make it bigger or smaller</string>
++    <string name="screenshare_resize_fill">Fill screen</string>
++    <string name="screenshare_resize_fit">Fit</string>
++    <string name="screenshare_resize_done">Done</string>
 +    <string name="screenshare_size_custom">Custom size and place…</string>
 +    <string name="screenshare_custom_width">Width: %1$d%%</string>
 +    <string name="screenshare_custom_height">Height: %1$d%%</string>
