@@ -1449,10 +1449,10 @@ index 00000000..fd017f2e
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..ce79f57a
+index 00000000..23f50807
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,591 @@
+@@ -0,0 +1,606 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1617,7 +1617,7 @@ index 00000000..ce79f57a
 +        var self: VideoPipeInputStream? = null
 +        val newPipe = VideoPipeInputStream(
 +            // Only the stream in use ends the sharing: the old one is closed on purpose
-+            onClosed = { if (synchronized(lock) { pipe === self }) stopStreaming() },
++            onClosed = { }, // The viewer leaving never ends the sharing
 +            onFirstRead = { requestKeyframe() },
 +        )
 +        self = newPipe
@@ -1652,6 +1652,19 @@ index 00000000..ce79f57a
 +        Thread({ drainLoop(newEncoder, newPipe) }, "ScreenEncoderDrain").start()
 +    }
 +
++    /** A viewer opened again while the screen is still shared: give it a fresh stream. */
++    private fun resendStream() {
++        val device = streamDevice ?: return
++        val newPipe = VideoPipeInputStream(onClosed = { }, onFirstRead = { requestKeyframe() })
++        val old = synchronized(lock) {
++            if (!running) return
++            pipe.also { pipe = newPipe }
++        }
++        old?.finish()
++        sendStream(device, streamWidth, streamHeight, streamPreset, newPipe)
++        requestKeyframe()
++    }
++
 +    private fun sendStream(device: Device, width: Int, height: Int, preset: ScreenPreset, source: VideoPipeInputStream) {
 +        val packet = NetworkPacket(ScreenSharePlugin.PACKET_TYPE_SCREENSHARE).apply {
 +            this["width"] = width
@@ -1667,7 +1680,7 @@ index 00000000..ce79f57a
 +
 +            override fun onFailure(e: Throwable) {
 +                Log.e(LOG_TAG, "Could not send the screen to ${device.name}", e)
-+                stopStreaming()
++                source.finish() // The link dropped: keep sharing, the viewer can reconnect
 +            }
 +        })
 +    }
@@ -1706,7 +1719,7 @@ index 00000000..ce79f57a
 +        var firstPipe: VideoPipeInputStream? = null
 +        val newPipe = VideoPipeInputStream(
 +            // The stream is replaced when the phone rotates; only the one in use ends the sharing
-+            onClosed = { if (synchronized(lock) { pipe === firstPipe }) stopStreaming() },
++            onClosed = { }, // The viewer leaving never ends the sharing
 +            onFirstRead = { requestKeyframe() },
 +        )
 +        firstPipe = newPipe
@@ -1743,11 +1756,6 @@ index 00000000..ce79f57a
 +        streamWidth = width
 +        streamHeight = height
 +        acquireLocks()
-+        if (autoStopMinutes > 0) {
-+            val stopper = Runnable { stopStreaming() }
-+            autoStop = stopper
-+            handler.postDelayed(stopper, autoStopMinutes * 60_000L)
-+        }
 +
 +        ScreenShareState.started(
 +            device.deviceId,
@@ -1755,6 +1763,7 @@ index 00000000..ce79f57a
 +                stop = { stopStreaming() },
 +                setBitrate = { bitrate -> setBitrate(bitrate) },
 +                requestKeyframe = { requestKeyframe() },
++                resend = { resendStream() },
 +            )
 +        )
 +
@@ -1816,10 +1825,14 @@ index 00000000..ce79f57a
 +            Thread({
 +                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 +                val buffer = ByteArray(AUDIO_CHUNK_BYTES)
-+                while (audioRunning) {
-+                    val read = activeRecord.read(buffer, 0, buffer.size)
-+                    if (read < 0) break
-+                    if (read > 0) newPipe.push(buffer.copyOf(read))
++                try {
++                    while (audioRunning) {
++                        val read = activeRecord.read(buffer, 0, buffer.size)
++                        if (read < 0) break
++                        if (read > 0) newPipe.push(buffer.copyOf(read))
++                    }
++                } catch (e: Exception) {
++                    // The recorder was released while reading
 +                }
 +            }, "ScreenAudioCapture").start()
 +        } catch (e: Exception) {
@@ -1897,38 +1910,40 @@ index 00000000..ce79f57a
 +        return format
 +    }
 +
-+    private fun drainLoop(codec: MediaCodec, destination: VideoPipeInputStream) {
-+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
++    private fun drainLoop(codec: MediaCodec, @Suppress("UNUSED_PARAMETER") firstDestination: VideoPipeInputStream) {
++        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) }
 +        val info = MediaCodec.BufferInfo()
 +        var config: ByteArray? = null
-+        while (running) {
-+            val index = try {
-+                codec.dequeueOutputBuffer(info, 10_000)
-+            } catch (e: Exception) {
-+                break // The encoder was stopped
-+            }
-+            if (index < 0) continue // Nothing yet, or the output format changed
++        while (running && encoder === codec) {
++            try {
++                val index = codec.dequeueOutputBuffer(info, 10_000)
++                if (index < 0) continue // Nothing yet, or the output format changed
 +
-+            val buffer = codec.getOutputBuffer(index)
-+            if (buffer != null && info.size > 0) {
-+                buffer.position(info.offset)
-+                buffer.limit(info.offset + info.size)
-+                val data = ByteArray(info.size)
-+                buffer.get(data)
++                val buffer = codec.getOutputBuffer(index)
++                if (buffer != null && info.size > 0) {
++                    buffer.position(info.offset)
++                    buffer.limit(info.offset + info.size)
++                    val data = ByteArray(info.size)
++                    buffer.get(data)
++                    val destination = synchronized(lock) { pipe }
 +
-+                if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-+                    config = data
-+                    destination.push(data, VideoPipeInputStream.FLAG_CONFIG, 0L)
-+                } else {
-+                    val isKey = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-+                    // Key frames carry the stream settings too, so a viewer can start at any of them
-+                    val saved = config
-+                    val frame = if (isKey && saved != null) saved + data else data
-+                    val flags = if (isKey) VideoPipeInputStream.FLAG_KEY else 0
-+                    if (destination.push(frame, flags, info.presentationTimeUs)) requestKeyframe()
++                    if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
++                        config = data
++                        destination?.push(data, VideoPipeInputStream.FLAG_CONFIG, 0L)
++                    } else {
++                        val isKey = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
++                        // Key frames carry the stream settings too, so a viewer can start at any of them
++                        val saved = config
++                        val frame = if (isKey && saved != null) saved + data else data
++                        val flags = if (isKey) VideoPipeInputStream.FLAG_KEY else 0
++                        if (destination?.push(frame, flags, info.presentationTimeUs) == true) requestKeyframe()
++                    }
 +                }
++                runCatching { codec.releaseOutputBuffer(index, false) }
++            } catch (e: Exception) {
++                // The encoder was stopped or replaced (rotation, stop): never let this crash the app
++                break
 +            }
-+            runCatching { codec.releaseOutputBuffer(index, false) }
 +        }
 +        // Ended by itself (not asked to stop, and not replaced by a new encoder after a rotation)
 +        if (running && encoder === codec) stopStreaming()
@@ -2046,7 +2061,7 @@ index 00000000..ce79f57a
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 new file mode 100644
-index 00000000..29ed8801
+index 00000000..1f3eaaa4
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenSharePlugin.kt
 @@ -0,0 +1,443 @@
@@ -2260,7 +2275,7 @@ index 00000000..29ed8801
 +
 +    private fun handleRequest(np: NetworkPacket): Boolean {
 +        when (np.getString("action")) {
-+            ACTION_START -> showShareRequest(
++            ACTION_START -> if (ScreenShareState.resendIfSharingWith(device.deviceId)) Unit else showShareRequest(
 +                ScreenPreset.fromName(np.getString("preset", ScreenPreset.DEFAULT.name)),
 +                np.getInt("autoStopMinutes", 0),
 +                np.getBoolean("sound", true)
@@ -2615,10 +2630,10 @@ index 00000000..cf7550a2
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
 new file mode 100644
-index 00000000..f24f7c21
+index 00000000..5cc2dd46
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenShareState.kt
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,94 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2643,6 +2658,7 @@ index 00000000..f24f7c21
 +        val stop: () -> Unit,
 +        val setBitrate: (Int) -> Unit,
 +        val requestKeyframe: () -> Unit,
++        val resend: () -> Unit = {},
 +    )
 +
 +    @Volatile
@@ -2666,6 +2682,12 @@ index 00000000..f24f7c21
 +
 +    fun stopIfSharingWith(deviceId: String) {
 +        if (activeDeviceId == deviceId) hostActions?.stop?.invoke()
++    }
++
++    fun resendIfSharingWith(deviceId: String): Boolean {
++        if (activeDeviceId != deviceId) return false
++        hostActions?.resend?.invoke()
++        return true
 +    }
 +
 +    fun setBitrateIfSharingWith(deviceId: String, bitrate: Int) {
@@ -2926,7 +2948,7 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..fffeb986
+index 00000000..e8190959
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 @@ -0,0 +1,752 @@
@@ -3075,7 +3097,7 @@ index 00000000..fffeb986
 +        touchSender.reset()
 +        decoder?.stop()
 +        decoder = null
-+        if (isFinishing) plugin()?.requestStop()
++        // Leaving the viewer (Back) never stops the other phone's sharing; only Stop does
 +        super.onDestroy()
 +    }
 +
