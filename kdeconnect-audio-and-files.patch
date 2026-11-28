@@ -2907,10 +2907,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..40b72425
+index 00000000..89b600fc
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,712 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2941,7 +2941,6 @@ index 00000000..40b72425
 +import android.widget.LinearLayout
 +import android.widget.SeekBar
 +import android.widget.TextView
-+import android.view.KeyEvent
 +import android.view.MotionEvent
 +import android.widget.Toast
 +import androidx.activity.ComponentActivity
@@ -3546,17 +3545,6 @@ index 00000000..40b72425
 +                }
 +            }
 +            .show()
-+    }
-+
-+    /** The volume keys of this phone change the volume of the other phone. */
-+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-+        if (decoder != null && settings.controlEnabled) {
-+            when (keyCode) {
-+                KeyEvent.KEYCODE_VOLUME_UP -> { plugin()?.sendSystem("volume_up"); return true }
-+                KeyEvent.KEYCODE_VOLUME_DOWN -> { plugin()?.sendSystem("volume_down"); return true }
-+            }
-+        }
-+        return super.onKeyDown(keyCode, event)
 +    }
 +
 +    private fun limitLabel(minutes: Int): String =
