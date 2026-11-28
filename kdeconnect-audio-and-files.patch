@@ -128,7 +128,7 @@ index e3a11628..5b1906ef 100644
              // Adding an action button to send clipboard manually in Android 10 and later.
              if (!ClipboardPlugin.canSyncAutomatically(this)) {
 diff --git a/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt b/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
-index bdc20f31..967c778b 100644
+index bdc20f31..a65270e3 100644
 --- a/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
 +++ b/src/main/java/org/kde/kdeconnect/backends/bluetooth/BluetoothLinkProvider.kt
 @@ -8,6 +8,7 @@ package org.kde.kdeconnect.backends.bluetooth
@@ -192,7 +192,21 @@ index bdc20f31..967c778b 100644
                  val deviceUuids = device.uuids
                  if (deviceUuids != null) {
                      for (thisUuid in deviceUuids) {
-@@ -422,6 +442,7 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+@@ -333,6 +353,13 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
+         }
+ 
+         private fun connectToDevice() {
++            // Both phones try to connect at the same moment and then turn each other away.
++            // A random pause lets one of them win; the other sees the finished link and stops.
++            try {
++                Thread.sleep((Math.random() * 4000).toLong())
++            } catch (_: InterruptedException) {
++            }
++            if (device != null && (sockets.containsKey(device))) return
+             val socket: BluetoothSocket
+             try {
+                 Log.i("BTLinkProvider/Client", "Cancelling Discovery")
+@@ -422,6 +449,7 @@ class BluetoothLinkProvider(private val context: Context) : BaseLinkProvider() {
      }
  
      companion object {
@@ -2730,10 +2744,10 @@ index 00000000..5cc2dd46
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenStreamDecoder.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenStreamDecoder.kt
 new file mode 100644
-index 00000000..aeb165d9
+index 00000000..143dabf3
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenStreamDecoder.kt
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,213 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2789,8 +2803,9 @@ index 00000000..aeb165d9
 +    /** Safe to call from any thread, and more than once. */
 +    fun stop() {
 +        stopped = true
-+        // Closing the payload closes its socket, which unblocks a read() in progress
-+        payload.close()
++        // Closing the payload closes its socket, which unblocks a read() in progress. Network
++        // calls are not allowed on the main thread (that crashed the app on Back), so go around.
++        Thread({ runCatching { payload.close() } }, "ScreenStreamClose").start()
 +    }
 +
 +    fun attachSurface(surface: Surface) {
@@ -2895,9 +2910,9 @@ index 00000000..aeb165d9
 +            if (!stopped) Log.i(LOG_TAG, "Screen stream ended: ${e.message}")
 +        } finally {
 +            stopped = true
-+            synchronized(lock) { releaseSessionLocked() }
-+            payload.close()
-+            if (ended.compareAndSet(false, true)) onEnded(this)
++            runCatching { synchronized(lock) { releaseSessionLocked() } }
++            runCatching { payload.close() }
++            if (ended.compareAndSet(false, true)) runCatching { onEnded(this) }
 +        }
 +    }
 +
@@ -2948,7 +2963,7 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..e8190959
+index 00000000..22465eaf
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 @@ -0,0 +1,752 @@
@@ -3094,8 +3109,8 @@ index 00000000..e8190959
 +    override fun onDestroy() {
 +        handler.removeCallbacks(statsTick)
 +        ScreenShareState.viewerListener = null
-+        touchSender.reset()
-+        decoder?.stop()
++        runCatching { touchSender.reset() }
++        runCatching { decoder?.stop() }
 +        decoder = null
 +        // Leaving the viewer (Back) never stops the other phone's sharing; only Stop does
 +        super.onDestroy()
