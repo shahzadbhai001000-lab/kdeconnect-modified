@@ -1,5 +1,5 @@
 diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
-index 8bf7ff8c..a12b2e61 100644
+index 8bf7ff8c..8f1ad603 100644
 --- a/src/main/AndroidManifest.xml
 +++ b/src/main/AndroidManifest.xml
 @@ -68,6 +68,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
@@ -54,6 +54,25 @@ index 8bf7ff8c..a12b2e61 100644
          <activity
              android:name="org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity"
              android:theme="@style/Theme.Transparent"
+@@ -365,6 +403,18 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+             </intent-filter>
+         </receiver>
+ 
++        <!-- The storage of paired phones, shown in the Files app and file pickers like a cloud drive -->
++        <provider
++            android:name="org.kde.kdeconnect.plugins.sftp.KdeConnectDocumentsProvider"
++            android:authorities="${applicationId}.documents"
++            android:exported="true"
++            android:grantUriPermissions="true"
++            android:permission="android.permission.MANAGE_DOCUMENTS">
++            <intent-filter>
++                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
++            </intent-filter>
++        </provider>
++
+         <provider
+             android:name="androidx.core.content.FileProvider"
+             android:authorities="${applicationId}.fileprovider"
 diff --git a/src/main/java/org/kde/kdeconnect/BackgroundService.kt b/src/main/java/org/kde/kdeconnect/BackgroundService.kt
 index e3a11628..5b1906ef 100644
 --- a/src/main/java/org/kde/kdeconnect/BackgroundService.kt
@@ -2907,10 +2926,10 @@ index 00000000..aeb165d9
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..89b600fc
+index 00000000..fffeb986
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,752 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -2923,6 +2942,7 @@ index 00000000..89b600fc
 +import android.content.Context
 +import android.content.pm.ActivityInfo
 +import android.graphics.Color
++import android.graphics.drawable.GradientDrawable
 +import android.graphics.Typeface
 +import android.os.Build
 +import android.os.Bundle
@@ -2975,7 +2995,8 @@ index 00000000..89b600fc
 +    private var shiftY = 0f
 +    private var resizeLastX = 0f
 +    private var resizeLastY = 0f
-+    private var resizeLastDist = 0f
++    private var resizeLastDx = 0f
++    private var resizeLastDy = 0f
 +    private var resizeLastCount = 0
 +    private lateinit var touchSender: TouchGestureSender
 +
@@ -3113,20 +3134,52 @@ index 00000000..89b600fc
 +                .apply { setMargins(dp(8), dp(8), 0, 0) }
 +        )
 +
-+        val bar = LinearLayout(this).apply {
-+            orientation = LinearLayout.HORIZONTAL
-+            alpha = 0.75f
++        // The top buttons live in a small bubble that drops down, so they don't cover the picture
++        val dropdown = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            alpha = 0.85f
++            visibility = View.GONE
++            background = GradientDrawable().apply {
++                setColor(0xCC000000.toInt())
++                cornerRadius = dp(10).toFloat()
++            }
++            setPadding(dp(4), dp(4), dp(4), dp(4))
 +        }
-+        bar.addView(barButton(R.string.screenshare_button_settings) { showSettingsMenu() })
-+        bar.addView(barButton(R.string.screenshare_button_stats) { toggleStats() })
-+        bar.addView(barButton(R.string.screenshare_button_size) { toggleResize() })
-+        controlButton = barButton(controlLabel()) { toggleControl() }
-+        bar.addView(controlButton)
-+        bar.addView(barButton(R.string.screenshare_button_stop) { stopAndClose() })
++        // Buttons close the dropdown after use, except the ones that show their own state
++        fun item(textRes: Int, closes: Boolean = true, onClick: () -> Unit): Button =
++            barButton(textRes) {
++                if (closes) dropdown.visibility = View.GONE
++                onClick()
++            }.also { dropdown.addView(it, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)) }
++
++        item(R.string.screenshare_button_settings) { showSettingsMenu() }
++        item(R.string.screenshare_button_stats, closes = false) { toggleStats() }
++        item(R.string.screenshare_button_size) { toggleResize() }
++        controlButton = item(controlLabel(), closes = false) { toggleControl() }
++        item(R.string.screenshare_button_stop) { stopAndClose() }
++
++        val bubble = TextView(this).apply {
++            text = "\u22EE"
++            setTextColor(Color.WHITE)
++            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
++            gravity = Gravity.CENTER
++            alpha = 0.7f
++            background = GradientDrawable().apply {
++                shape = GradientDrawable.OVAL
++                setColor(0xAA000000.toInt())
++            }
++            setOnClickListener {
++                dropdown.visibility = if (dropdown.visibility == View.VISIBLE) View.GONE else View.VISIBLE
++            }
++        }
 +        root.addView(
-+            bar,
++            bubble,
++            FrameLayout.LayoutParams(dp(34), dp(34), Gravity.TOP or Gravity.END).apply { setMargins(0, dp(6), dp(6), 0) }
++        )
++        root.addView(
++            dropdown,
 +            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END)
-+                .apply { setMargins(0, dp(4), dp(4), 0) }
++                .apply { setMargins(0, dp(44), dp(6), 0) }
 +        )
 +
 +        val nav = LinearLayout(this).apply {
@@ -3242,23 +3295,27 @@ index 00000000..89b600fc
 +        if (count == 0) return
 +        cx /= count
 +        cy /= count
-+        var dist = 0f
++        // How far apart the two fingers are sideways and up/down: they resize width and height separately
++        var dx = 0f
++        var dy = 0f
 +        if (count >= 2) {
 +            val indices = (0 until event.pointerCount).filter { it != lifting }
-+            dist = Math.hypot(
-+                (event.getX(indices[0]) - event.getX(indices[1])).toDouble(),
-+                (event.getY(indices[0]) - event.getY(indices[1])).toDouble()
-+            ).toFloat()
++            dx = Math.abs(event.getX(indices[0]) - event.getX(indices[1]))
++            dy = Math.abs(event.getY(indices[0]) - event.getY(indices[1]))
 +        }
 +
 +        when (event.actionMasked) {
 +            MotionEvent.ACTION_MOVE -> if (count == resizeLastCount) {
 +                shiftX += (cx - resizeLastX) / parentWidth * 100f
 +                shiftY += (cy - resizeLastY) / parentHeight * 100f
-+                if (count >= 2 && resizeLastDist > 0f && dist > 0f) {
-+                    val factor = dist / resizeLastDist
-+                    sizeW = (sizeW * factor).coerceIn(MIN_PERCENT, MAX_PERCENT)
-+                    sizeH = (sizeH * factor).coerceIn(MIN_PERCENT, MAX_PERCENT)
++                if (count >= 2) {
++                    // An axis only changes while the fingers are clearly apart along it, so there is no fixed ratio
++                    if (resizeLastDx > MIN_SPREAD_PX && dx > MIN_SPREAD_PX) {
++                        sizeW = (sizeW * dx / resizeLastDx).coerceIn(MIN_PERCENT, MAX_PERCENT)
++                    }
++                    if (resizeLastDy > MIN_SPREAD_PX && dy > MIN_SPREAD_PX) {
++                        sizeH = (sizeH * dy / resizeLastDy).coerceIn(MIN_PERCENT, MAX_PERCENT)
++                    }
 +                }
 +                shiftX = shiftX.coerceIn(-100f, 100f)
 +                shiftY = shiftY.coerceIn(-100f, 100f)
@@ -3273,7 +3330,8 @@ index 00000000..89b600fc
 +        // Remember where the fingers are, so the next move is measured from here
 +        resizeLastX = cx
 +        resizeLastY = cy
-+        resizeLastDist = dist
++        resizeLastDx = dx
++        resizeLastDy = dy
 +        resizeLastCount = count
 +    }
 +
@@ -3618,6 +3676,7 @@ index 00000000..89b600fc
 +        const val EXTRA_DEVICE_ID = "deviceId"
 +        const val EXTRA_AUTO_REQUEST = "autoRequest"
 +        private const val STATS_INTERVAL_MS = 1000L
++        private const val MIN_SPREAD_PX = 60f
 +        private const val MIN_PERCENT = 20f
 +        private const val MAX_PERCENT = 300f
 +
@@ -4815,6 +4874,339 @@ index 00000000..8a61aba3
 +        return granted
 +    }
 +}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/KdeConnectDocumentsProvider.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/KdeConnectDocumentsProvider.kt
+new file mode 100644
+index 00000000..94ccf3ab
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/KdeConnectDocumentsProvider.kt
+@@ -0,0 +1,327 @@
++/*
++ * SPDX-FileCopyrightText: 2026 KDE Connect contributors
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sftp
++
++import android.content.Context
++import android.database.Cursor
++import android.database.MatrixCursor
++import android.graphics.BitmapFactory
++import android.graphics.Point
++import android.os.Build
++import android.os.CancellationSignal
++import android.os.Handler
++import android.os.HandlerThread
++import android.os.ParcelFileDescriptor
++import android.os.ProxyFileDescriptorCallback
++import android.os.storage.StorageManager
++import android.provider.DocumentsContract
++import android.provider.DocumentsContract.Document
++import android.provider.DocumentsContract.Root
++import android.provider.DocumentsProvider
++import android.system.ErrnoException
++import android.system.OsConstants
++import android.content.res.AssetFileDescriptor
++import android.util.Log
++import android.webkit.MimeTypeMap
++import androidx.annotation.RequiresApi
++import kotlinx.coroutines.runBlocking
++import org.kde.kdeconnect.BackgroundService
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect_tp.R
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.io.FileNotFoundException
++import java.io.IOException
++
++/**
++ * Shows the storage of every connected, paired phone as a cloud-storage location (like Google Drive)
++ * in Android's file picker and in the Files app. Pictures open without downloading and have thumbnails.
++ *
++ * Document ids look like "deviceId:/storage/emulated/0/DCIM". "deviceId:" alone is the top of the
++ * phone, which lists its storage locations (or the contents of the only one).
++ */
++class KdeConnectDocumentsProvider : DocumentsProvider() {
++
++    private class Connection(val client: RemoteSftpClient, val roots: List<RemoteSftpRoot>)
++
++    private val connections = HashMap<String, Connection>()
++    private var callbackRegistered = false
++
++    private val proxyThread: HandlerThread by lazy { HandlerThread("KdeConnectDocumentsProxy").also { it.start() } }
++    private val proxyHandler: Handler by lazy { Handler(proxyThread.looper) }
++
++    private val authority: String
++        get() = context!!.packageName + ".documents"
++
++    override fun onCreate(): Boolean = true
++
++    // -- Roots ---------------------------------------------------------------------------------
++
++    override fun queryRoots(projection: Array<out String>?): Cursor {
++        val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
++        val ctx = context ?: return result
++        runCatching { BackgroundService.Start(ctx) } // Make sure KDE Connect is running and connected
++        registerCallbackOnce()
++
++        for (device in KdeConnect.getInstance().devices.values) {
++            if (!device.isPaired || !device.isReachable) continue
++            if (device.getPlugin(SftpPlugin::class.java) == null) continue
++            result.newRow().apply {
++                add(Root.COLUMN_ROOT_ID, device.deviceId)
++                add(Root.COLUMN_DOCUMENT_ID, rootDocumentId(device.deviceId))
++                add(Root.COLUMN_TITLE, device.name)
++                add(Root.COLUMN_SUMMARY, ctx.getString(R.string.documents_root_summary))
++                add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
++                add(Root.COLUMN_MIME_TYPES, "*/*")
++                add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_IS_CHILD)
++            }
++        }
++        return result
++    }
++
++    private fun registerCallbackOnce() {
++        synchronized(this) {
++            if (callbackRegistered) return
++            callbackRegistered = true
++        }
++        KdeConnect.getInstance().addDeviceListChangedCallback("DocumentsProvider") {
++            // Tell the Files app that phones appeared or disappeared
++            context?.contentResolver?.notifyChange(DocumentsContract.buildRootsUri(authority), null)
++        }
++    }
++
++    // -- Browsing ------------------------------------------------------------------------------
++
++    override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
++        val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
++        val (deviceId, path) = split(documentId)
++        if (path.isEmpty()) {
++            val name = KdeConnect.getInstance().getDevice(deviceId)?.name ?: deviceId
++            addRow(result, documentId, name, true, 0L, 0L)
++        } else {
++            val file = withClient(deviceId) { it.client.stat(path) }
++            addFile(result, deviceId, file)
++        }
++        return result
++    }
++
++    override fun queryChildDocuments(parentDocumentId: String, projection: Array<out String>?, sortOrder: String?): Cursor {
++        val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
++        val (deviceId, path) = split(parentDocumentId)
++        withClient(deviceId) { connection ->
++            when {
++                path.isNotEmpty() -> connection.client.list(path).forEach { addFile(result, deviceId, it) }
++                connection.roots.size == 1 -> connection.client.list(connection.roots[0].path).forEach { addFile(result, deviceId, it) }
++                else -> connection.roots.forEach { addRow(result, documentId(deviceId, it.path), it.name, true, 0L, 0L) }
++            }
++        }
++        return result
++    }
++
++    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
++        val (parentDevice, parentPath) = split(parentDocumentId)
++        val (device, path) = split(documentId)
++        if (parentDevice != device) return false
++        return parentPath.isEmpty() || path == parentPath || path.startsWith(parentPath.trimEnd('/') + "/")
++    }
++
++    // -- Opening, thumbnails -------------------------------------------------------------------
++
++    override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
++        val (deviceId, path) = split(documentId)
++        if (path.isEmpty()) throw FileNotFoundException("Not a file")
++        val writing = mode.contains('w') || mode.contains('a')
++        val truncate = mode.contains('t') || (mode == "w")
++        val client = withClient(deviceId) { it.client }
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            return try {
++                val size = if (writing && truncate) 0L else runCatching { client.stat(path).size }.getOrDefault(0L)
++                val access = client.openRandom(path, writing, truncate)
++                val callback = RemoteFileCallback(access, size)
++                context!!.getSystemService(StorageManager::class.java)
++                    .openProxyFileDescriptor(ParcelFileDescriptor.parseMode(mode), callback, proxyHandler)
++            } catch (e: IOException) {
++                dropConnection(deviceId)
++                throw FileNotFoundException(e.message)
++            }
++        }
++
++        // Android 7: no streaming, so download the file first (reading only)
++        if (writing) throw FileNotFoundException("Writing needs Android 8 or newer")
++        val temp = File.createTempFile("remote", ".tmp", context!!.cacheDir)
++        try {
++            client.openRead(path).use { input -> temp.outputStream().use { input.copyTo(it) } }
++        } catch (e: IOException) {
++            temp.delete()
++            throw FileNotFoundException(e.message)
++        }
++        return ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY).also { temp.deleteOnExit() }
++    }
++
++    @RequiresApi(Build.VERSION_CODES.O)
++    private class RemoteFileCallback(private val access: RemoteRandomAccess, private var size: Long) : ProxyFileDescriptorCallback() {
++        override fun onGetSize(): Long = size
++
++        override fun onRead(offset: Long, size: Int, data: ByteArray): Int {
++            try {
++                var total = 0
++                while (total < size) {
++                    val read = access.read(offset + total, data, total, size - total)
++                    if (read <= 0) break
++                    total += read
++                }
++                return total
++            } catch (e: IOException) {
++                throw ErrnoException("onRead", OsConstants.EIO)
++            }
++        }
++
++        override fun onWrite(offset: Long, size: Int, data: ByteArray): Int {
++            try {
++                access.write(offset, data, 0, size)
++                this.size = maxOf(this.size, offset + size)
++                return size
++            } catch (e: IOException) {
++                throw ErrnoException("onWrite", OsConstants.EIO)
++            }
++        }
++
++        override fun onFsync() {}
++
++        override fun onRelease() {
++            access.close()
++        }
++    }
++
++    override fun openDocumentThumbnail(documentId: String, sizeHint: Point, signal: CancellationSignal?): AssetFileDescriptor {
++        val (deviceId, path) = split(documentId)
++        val client = withClient(deviceId) { it.client }
++        val file = client.stat(path)
++        if (file.size > MAX_THUMBNAIL_SOURCE_BYTES) throw FileNotFoundException("Too big for a thumbnail")
++
++        val bytes = client.openRead(path).use { it.readBytes() }
++        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
++        var sample = 1
++        while (bounds.outWidth / (sample * 2) >= sizeHint.x && bounds.outHeight / (sample * 2) >= sizeHint.y) sample *= 2
++        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
++            ?: throw FileNotFoundException("Not a picture")
++
++        val out = ByteArrayOutputStream()
++        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
++        bitmap.recycle()
++        val temp = File.createTempFile("thumb", ".jpg", context!!.cacheDir)
++        temp.writeBytes(out.toByteArray())
++        temp.deleteOnExit()
++        return AssetFileDescriptor(ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY), 0, temp.length())
++    }
++
++    // -- Changing things -----------------------------------------------------------------------
++
++    override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
++        val (deviceId, parentPath) = split(parentDocumentId)
++        val base = parentPath.ifEmpty { withClient(deviceId) { it.roots.firstOrNull()?.path } ?: throw FileNotFoundException("No storage") }
++        val path = RemoteSftpClient.join(base, displayName)
++        withClient(deviceId) { connection ->
++            if (mimeType == Document.MIME_TYPE_DIR) {
++                connection.client.createDirectory(path)
++            } else {
++                connection.client.openRandom(path, write = true, truncate = true).close()
++            }
++        }
++        return documentId(deviceId, path)
++    }
++
++    override fun deleteDocument(documentId: String) {
++        val (deviceId, path) = split(documentId)
++        withClient(deviceId) { it.client.delete(it.client.stat(path)) }
++    }
++
++    override fun renameDocument(documentId: String, displayName: String): String {
++        val (deviceId, path) = split(documentId)
++        val newPath = RemoteSftpClient.join(path.trimEnd('/').substringBeforeLast('/', "/"), displayName)
++        withClient(deviceId) { it.client.rename(path, newPath) }
++        return documentId(deviceId, newPath)
++    }
++
++    // -- Helpers -------------------------------------------------------------------------------
++
++    private fun rootDocumentId(deviceId: String) = "$deviceId:"
++
++    private fun documentId(deviceId: String, path: String) = "$deviceId:$path"
++
++    private fun split(documentId: String): Pair<String, String> =
++        documentId.substringBefore(':') to documentId.substringAfter(':', "")
++
++    private fun addFile(cursor: MatrixCursor, deviceId: String, file: RemoteFile) {
++        addRow(cursor, documentId(deviceId, file.path), file.name, file.isDirectory, file.size, file.modifiedMillis)
++    }
++
++    private fun addRow(cursor: MatrixCursor, id: String, name: String, directory: Boolean, size: Long, modified: Long) {
++        val mime = if (directory) Document.MIME_TYPE_DIR else mimeTypeOf(name)
++        var flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
++        flags = flags or if (directory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
++        if (mime.startsWith("image/")) flags = flags or Document.FLAG_SUPPORTS_THUMBNAIL
++        cursor.newRow().apply {
++            add(Document.COLUMN_DOCUMENT_ID, id)
++            add(Document.COLUMN_DISPLAY_NAME, name)
++            add(Document.COLUMN_SIZE, size)
++            add(Document.COLUMN_MIME_TYPE, mime)
++            add(Document.COLUMN_LAST_MODIFIED, modified.takeIf { it > 0 })
++            add(Document.COLUMN_FLAGS, flags)
++        }
++    }
++
++    private fun mimeTypeOf(name: String): String {
++        val extension = name.substringAfterLast('.', "").lowercase()
++        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
++    }
++
++    /** Runs [block] with a connection to the phone, connecting (or reconnecting once) when needed. */
++    private fun <T> withClient(deviceId: String, block: (Connection) -> T): T {
++        var failure: IOException? = null
++        repeat(2) {
++            try {
++                return block(connectionFor(deviceId))
++            } catch (e: IOException) {
++                failure = e
++                dropConnection(deviceId) // The connection went stale: reconnect and try once more
++            }
++        }
++        throw FileNotFoundException(failure?.message ?: "Could not reach the phone")
++    }
++
++    @Synchronized
++    private fun connectionFor(deviceId: String): Connection {
++        connections[deviceId]?.let { return it }
++        val device = KdeConnect.getInstance().getDevice(deviceId)
++            ?: throw FileNotFoundException("Unknown phone")
++        if (!device.isReachable) throw FileNotFoundException("The phone is not connected")
++        val plugin = device.getPlugin(SftpPlugin::class.java) ?: throw FileNotFoundException("File access is off for this phone")
++        val session = runBlocking { plugin.requestRemoteSession() }
++        val client = RemoteSftpClient(session, device.certificate.publicKey).also { it.connect() }
++        return Connection(client, session.roots).also { connections[deviceId] = it }
++    }
++
++    @Synchronized
++    private fun dropConnection(deviceId: String) {
++        connections.remove(deviceId)?.client?.let { runCatching { it.close() } }
++    }
++
++    private companion object {
++        const val MAX_THUMBNAIL_SOURCE_BYTES = 12L * 1024 * 1024
++
++        val DEFAULT_ROOT_PROJECTION = arrayOf(
++            Root.COLUMN_ROOT_ID, Root.COLUMN_DOCUMENT_ID, Root.COLUMN_TITLE, Root.COLUMN_SUMMARY,
++            Root.COLUMN_ICON, Root.COLUMN_MIME_TYPES, Root.COLUMN_FLAGS,
++        )
++        val DEFAULT_DOCUMENT_PROJECTION = arrayOf(
++            Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_SIZE,
++            Document.COLUMN_MIME_TYPE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS,
++        )
++    }
++}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/LocalDownloads.kt
 new file mode 100644
 index 00000000..f2646b61
@@ -5679,10 +6071,10 @@ index 00000000..b9a647b4
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt
 new file mode 100644
-index 00000000..6143d81c
+index 00000000..5436ab66
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/sftp/RemoteSftpClient.kt
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,269 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -5694,6 +6086,7 @@ index 00000000..6143d81c
 +import org.apache.sshd.client.keyverifier.ServerKeyVerifier
 +import org.apache.sshd.client.session.ClientSession
 +import org.apache.sshd.sftp.client.SftpClient
++import org.apache.sshd.sftp.client.SftpClient.OpenMode
 +import org.apache.sshd.sftp.client.SftpClientFactory
 +import java.io.Closeable
 +import java.io.IOException
@@ -5721,6 +6114,28 @@ index 00000000..6143d81c
 +    val size: Long,
 +    val modifiedMillis: Long,
 +)
++
++/** A file opened for reading or writing at any position. Close it when done. */
++class RemoteRandomAccess internal constructor(
++    private val sftp: SftpClient,
++    private val handle: SftpClient.CloseableHandle,
++) : Closeable {
++
++    /** @return how many bytes were read, or -1 at the end of the file */
++    @Throws(IOException::class)
++    fun read(offset: Long, buffer: ByteArray, bufferOffset: Int, length: Int): Int =
++        sftp.read(handle, offset, buffer, bufferOffset, length)
++
++    @Throws(IOException::class)
++    fun write(offset: Long, buffer: ByteArray, bufferOffset: Int, length: Int) {
++        sftp.write(handle, offset, buffer, bufferOffset, length)
++    }
++
++    override fun close() {
++        runCatching { handle.close() }
++        runCatching { sftp.close() }
++    }
++}
 +
 +/**
 + * A client for the SFTP server that the other device exposes through its Filesystem access plugin.
@@ -5777,6 +6192,34 @@ index 00000000..6143d81c
 +            result.add(RemoteFile(name, fullPath, attributes.isDirectory, attributes.size, modified))
 +        }
 +        result.sortedWith(compareBy<RemoteFile>({ !it.isDirectory }, { it.name.lowercase() }))
++    }
++
++    /** Information about one file or folder (following links). */
++    @Throws(IOException::class)
++    fun stat(path: String): RemoteFile = withBrowseClient { sftp ->
++        val attributes = sftp.stat(path)
++        val modified = runCatching { attributes.modifyTime.toMillis() }.getOrDefault(0L)
++        RemoteFile(path.trimEnd('/').substringAfterLast('/'), path, attributes.isDirectory, attributes.size, modified)
++    }
++
++    /**
++     * Opens a file to read or write at any position (the Files app needs this to open pictures,
++     * videos and so on without downloading them first). It has its own SFTP channel.
++     */
++    @Throws(IOException::class)
++    fun openRandom(path: String, write: Boolean, truncate: Boolean = false): RemoteRandomAccess {
++        val sftp = newSftpClient()
++        try {
++            val modes = if (write) {
++                if (truncate) setOf(OpenMode.Write, OpenMode.Create, OpenMode.Truncate) else setOf(OpenMode.Write, OpenMode.Create)
++            } else {
++                setOf(OpenMode.Read)
++            }
++            return RemoteRandomAccess(sftp, sftp.open(path, modes))
++        } catch (e: Exception) {
++            runCatching { sftp.close() }
++            throw if (e is IOException) e else IOException(e.message, e)
++        }
 +    }
 +
 +    @Throws(IOException::class)
@@ -6287,13 +6730,14 @@ index 00000000..c9ee66c5
 +        android:pathData="M10,4H4C2.9,4 2.01,4.9 2.01,6L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"/>
 +</vector>
 diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
-index d8b73918..d6186d6e 100644
+index d8b73918..52b43018 100644
 --- a/src/main/res/values/strings.xml
 +++ b/src/main/res/values/strings.xml
-@@ -631,6 +631,23 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -631,6 +631,24 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="plugin_stats">Plugin stats</string>
  
      <string name="enable_udp_broadcast">Enable UDP device discovery</string>
++    <string name="documents_root_summary">KDE Connect phone storage</string>
 +    <string name="link_mode_title">Connection type</string>
 +    <string name="link_mode_auto">Automatic: Wi-Fi, with Bluetooth as backup</string>
 +    <string name="link_mode_wifi">Wi-Fi only</string>
@@ -6314,7 +6758,7 @@ index d8b73918..d6186d6e 100644
      <string name="enable_bluetooth">Enable bluetooth (beta)</string>
  
      <string name="receive_notifications_permission_explanation">Notifications need to be allowed to receive them from other devices</string>
-@@ -671,4 +688,119 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -671,4 +689,119 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
      <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
  
      <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
@@ -6400,7 +6844,7 @@ index d8b73918..d6186d6e 100644
 +    <string name="screenshare_size_fit">Fit (keep proportions)</string>
 +    <string name="screenshare_size_zoom">Zoom (fill, crop the edges)</string>
 +    <string name="screenshare_button_size">Size</string>
-+    <string name="screenshare_resize_hint">Drag to move the picture, pinch to make it bigger or smaller</string>
++    <string name="screenshare_resize_hint">Drag to move the picture. Two fingers: spread sideways for width, up and down for height</string>
 +    <string name="screenshare_resize_fill">Fill screen</string>
 +    <string name="screenshare_resize_fit">Fit</string>
 +    <string name="screenshare_resize_done">Done</string>
