@@ -1463,10 +1463,10 @@ index 00000000..fd017f2e
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
 new file mode 100644
-index 00000000..98f8cacb
+index 00000000..acd9c3e6
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenCaptureService.kt
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,621 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -1610,7 +1610,7 @@ index 00000000..98f8cacb
 +    }
 +
 +    @Suppress("DEPRECATION")
-+    private fun restartForNewSize() {
++    private fun restartForNewSize(force: Boolean = false) {
 +        val device = streamDevice ?: return
 +        val preset = streamPreset
 +        val liveDisplay = synchronized(lock) { if (running) display else null } ?: return
@@ -1618,12 +1618,13 @@ index 00000000..98f8cacb
 +        val metrics = DisplayMetrics()
 +        getSystemService<WindowManager>()!!.defaultDisplay.getRealMetrics(metrics)
 +        val (width, height) = scaledSize(metrics.widthPixels, metrics.heightPixels, preset.maxSide)
-+        if (width == streamWidth && height == streamHeight) return
++        if (!force && width == streamWidth && height == streamHeight) return
 +
 +        val created = try {
 +            createEncoder(width, height, preset)
 +        } catch (e: Exception) {
 +            Log.w(LOG_TAG, "Could not resize the stream", e)
++            if (force) stopStreaming()
 +            return
 +        }
 +        val (newEncoder, newSurface) = created
@@ -1963,7 +1964,8 @@ index 00000000..98f8cacb
 +            }
 +        }
 +        // Ended by itself (not asked to stop, and not replaced by a new encoder after a rotation)
-+        if (running && encoder === codec) stopStreaming()
++        // Ended by itself: build a new encoder instead of giving up
++        if (running && encoder === codec) handler.post { if (running && encoder === codec) restartForNewSize(force = true) }
 +    }
 +
 +    private fun requestKeyframe() {
@@ -2976,10 +2978,10 @@ index 00000000..143dabf3
 +}
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
 new file mode 100644
-index 00000000..e4737dd9
+index 00000000..c6d31b5b
 --- /dev/null
 +++ b/src/main/java/org/kde/kdeconnect/plugins/screenshare/ScreenViewerActivity.kt
-@@ -0,0 +1,784 @@
+@@ -0,0 +1,796 @@
 +/*
 + * SPDX-FileCopyrightText: 2026 KDE Connect contributors
 + *
@@ -3463,6 +3465,18 @@ index 00000000..e4737dd9
 +        decoder = null
 +        statusView.text = getString(R.string.screenshare_ended)
 +        statusView.visibility = View.VISIBLE
++        scheduleReconnect(0)
++    }
++
++    /** The link may have dropped for a moment: ask the other phone for the stream again. */
++    private fun scheduleReconnect(attempt: Int) {
++        if (attempt >= 8) return
++        handler.postDelayed({
++            if (!isFinishing && !isDestroyed && decoder == null) {
++                plugin()?.requestStart(settings.preset, 0, settings.soundEnabled)
++                scheduleReconnect(attempt + 1)
++            }
++        }, 2500L)
 +    }
 +
 +    private fun requestStart() {
